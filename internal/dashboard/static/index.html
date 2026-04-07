@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PolySnipe Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9; font-size: 14px; }
+    header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+    header h1 { font-size: 18px; color: #58a6ff; }
+    .badge { padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+    .badge.live { background: #238636; color: #fff; }
+    .badge.halted { background: #da3633; color: #fff; }
+    .badge.connecting { background: #9e6a03; color: #fff; }
+    main { padding: 24px; display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+    .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: #8b949e; margin-bottom: 12px; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+    .metric { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #21262d; }
+    .metric:last-child { border-bottom: none; }
+    .metric .label { color: #8b949e; }
+    .metric .value { color: #e6edf3; font-weight: bold; }
+    .metric .value.positive { color: #3fb950; }
+    .metric .value.negative { color: #f85149; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 8px 6px; color: #8b949e; font-weight: normal; border-bottom: 1px solid #30363d; }
+    td { padding: 8px 6px; border-bottom: 1px solid #21262d; }
+    tr:last-child td { border-bottom: none; }
+    .no-data { color: #8b949e; font-style: italic; text-align: center; padding: 20px; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+    button { padding: 8px 16px; border: 1px solid #30363d; border-radius: 6px; background: #21262d; color: #c9d1d9; cursor: pointer; font-size: 13px; }
+    button:hover { background: #30363d; border-color: #8b949e; }
+    button.danger { border-color: #da3633; color: #f85149; }
+    button.danger:hover { background: #da363333; }
+    button.success { border-color: #238636; color: #3fb950; }
+    button.success:hover { background: #23863633; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    .status-dot.green { background: #3fb950; }
+    .status-dot.red { background: #f85149; }
+    .status-dot.yellow { background: #d29922; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    footer { text-align: center; color: #8b949e; font-size: 12px; padding: 16px; border-top: 1px solid #30363d; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>PolySnipe</h1>
+    <span id="conn-badge" class="badge connecting">Connecting...</span>
+    <span id="halt-badge" style="display:none" class="badge halted">TRADING HALTED</span>
+    <span style="margin-left:auto; color:#8b949e; font-size:12px" id="last-update">--</span>
+  </header>
+
+  <main>
+    <!-- Bot Health -->
+    <div class="card">
+      <h2>Bot Health</h2>
+      <div class="metric"><span class="label">Uptime</span><span class="value" id="uptime">--</span></div>
+      <div class="metric"><span class="label">Goroutines</span><span class="value" id="goroutines">--</span></div>
+      <div class="metric"><span class="label">Session P&amp;L</span><span class="value" id="session-pnl">--</span></div>
+      <div class="metric"><span class="label">Total Exposure</span><span class="value" id="exposure">--</span></div>
+      <div class="metric"><span class="label">Last Error</span><span class="value" id="last-error" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">--</span></div>
+    </div>
+
+    <!-- Controls -->
+    <div class="card">
+      <h2>Controls</h2>
+      <div class="controls">
+        <button class="danger" onclick="halt()">Halt All Trading</button>
+        <button class="success" onclick="resume()">Resume Trading</button>
+      </div>
+      <p style="color:#8b949e;font-size:12px;margin-top:12px">Strategy controls: <code>POST /api/strategy/pause?id=NAME</code></p>
+    </div>
+
+    <!-- Positions -->
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>Open Positions</h2>
+      <div id="positions-container">
+        <p class="no-data">No open positions.</p>
+      </div>
+    </div>
+  </main>
+
+  <footer>PolySnipe &mdash; connected via WebSocket</footer>
+
+  <script>
+    let ws;
+    let reconnectTimer;
+
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+      ws.onopen = () => {
+        document.getElementById('conn-badge').textContent = 'Live';
+        document.getElementById('conn-badge').className = 'badge live';
+        clearTimeout(reconnectTimer);
+      };
+
+      ws.onclose = () => {
+        document.getElementById('conn-badge').textContent = 'Disconnected';
+        document.getElementById('conn-badge').className = 'badge connecting';
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+
+      ws.onerror = () => ws.close();
+
+      ws.onmessage = (e) => {
+        try { updateUI(JSON.parse(e.data)); } catch {}
+      };
+    }
+
+    function updateUI(data) {
+      document.getElementById('last-update').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+      document.getElementById('uptime').textContent = formatDuration(data.uptime_seconds || 0);
+      document.getElementById('goroutines').textContent = data.goroutines ?? '--';
+      document.getElementById('exposure').textContent = data.total_exposure ?? '--';
+
+      const pnl = parseFloat(data.session_pnl) || 0;
+      const pnlEl = document.getElementById('session-pnl');
+      pnlEl.textContent = pnl.toFixed(4);
+      pnlEl.className = 'value ' + (pnl >= 0 ? 'positive' : 'negative');
+
+      const errEl = document.getElementById('last-error');
+      errEl.textContent = data.last_error || 'none';
+
+      const haltBadge = document.getElementById('halt-badge');
+      haltBadge.style.display = data.halted ? '' : 'none';
+
+      renderPositions(data.positions || []);
+    }
+
+    function renderPositions(positions) {
+      const el = document.getElementById('positions-container');
+      if (!positions.length) {
+        el.innerHTML = '<p class="no-data">No open positions.</p>';
+        return;
+      }
+      let html = '<table><thead><tr><th>Strategy</th><th>Market</th><th>Side</th><th>Entry Price</th><th>Size</th></tr></thead><tbody>';
+      for (const p of positions) {
+        html += `<tr>
+          <td>${p.strategy_id}</td>
+          <td>${p.market_id}</td>
+          <td>${p.side}</td>
+          <td>${p.entry_price}</td>
+          <td>${p.size}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }
+
+    function formatDuration(seconds) {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = Math.floor(seconds % 60);
+      return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    }
+
+    async function halt() {
+      if (!confirm('Halt all trading?')) return;
+      await fetch('/api/halt', { method: 'POST' });
+    }
+
+    async function resume() {
+      await fetch('/api/resume', { method: 'POST' });
+    }
+
+    connect();
+  </script>
+</body>
+</html>

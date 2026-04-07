@@ -1,0 +1,148 @@
+# ============================================================
+# PolySnipe Configuration
+# Restart required to apply changes.
+# ============================================================
+
+# --- Connection ---
+connection:
+  websocket_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  rest_base_url: "https://clob.polymarket.com"
+  api_key: "${POLYMARKET_API_KEY}"         # env var substitution
+  api_secret: "${POLYMARKET_API_SECRET}"
+  passphrase: "${POLYMARKET_PASSPHRASE}"
+  reconnect_max_retries: 10
+  reconnect_backoff_base_ms: 500
+  reconnect_backoff_max_ms: 30000
+  request_timeout_ms: 5000
+
+# --- Markets ---
+markets:
+  - id: "btc-5min-up"
+    condition_id: "0x0000000000000000000000000000000000000000000000000000000000000001"
+    token_id_yes: "0x0000000000000000000000000000000000000000000000000000000000000002"
+    token_id_no: "0x0000000000000000000000000000000000000000000000000000000000000003"
+    label: "BTC 5-Min Up"
+  - id: "btc-5min-down"
+    condition_id: "0x0000000000000000000000000000000000000000000000000000000000000004"
+    token_id_yes: "0x0000000000000000000000000000000000000000000000000000000000000005"
+    token_id_no: "0x0000000000000000000000000000000000000000000000000000000000000006"
+    label: "BTC 5-Min Down"
+
+# --- Execution ---
+execution:
+  order_type: "limit"                      # only "limit" supported
+  default_limit_offset_bps: 10             # basis points from mid for limit price
+  order_timeout_seconds: 30                # cancel unfilled orders after this
+  partial_fill_action: "keep"              # "keep" or "cancel" on partial fill
+  retry_on_failure: true
+  retry_max_attempts: 3
+  retry_backoff_ms: 200
+  cooldown_between_orders_ms: 100
+
+# --- Sizing (Kelly Criterion) ---
+sizing:
+  method: "kelly"                          # "kelly" or "fixed_fraction"
+  kelly_fraction: 0.25                     # quarter-Kelly
+  kelly_min_sample_size: 20                # trades needed before Kelly kicks in
+  fixed_fraction_fallback: 0.02            # 2% of balance when insufficient data
+  min_order_size: 1.0                      # minimum dollar order
+  max_order_size: 500.0                    # maximum dollar order regardless of Kelly
+
+# --- Risk Management ---
+risk:
+  global:
+    max_total_exposure: 5000.0
+    session_loss_limit: -500.0
+    max_daily_trades: 200
+    max_drawdown_pct: 15.0                 # halt if drawdown exceeds 15% from peak
+  per_market:
+    default:
+      max_exposure: 2000.0
+      max_strategies_active: 4
+    overrides:                             # per-market overrides
+      btc-5min-up:
+        max_exposure: 3000.0
+        max_strategies_active: 4
+  per_strategy:
+    default:
+      max_position_size: 500.0
+      max_open_orders: 1
+    overrides:                             # per-strategy overrides
+      spread_threshold:
+        max_position_size: 200.0
+        max_open_orders: 1
+
+# --- Strategies ---
+strategies:
+  spread_threshold:
+    enabled: true
+    markets: ["btc-5min-up", "btc-5min-down"]
+    params:
+      spread_trigger_bps: 50
+      spread_exit_bps: 20
+      side: "cheap"
+  momentum:
+    enabled: true
+    markets: ["btc-5min-up"]
+    params:
+      consecutive_ticks: 5
+      min_move_bps: 10
+      hold_duration_seconds: 60
+  time_decay:
+    enabled: true
+    markets: ["btc-5min-up", "btc-5min-down"]
+    params:
+      trigger_remaining_seconds: 30
+      skew_threshold: 0.70
+  # --- Stub slots for user-implemented strategies ---
+  mid_flip:
+    enabled: false
+    markets: []
+    params: {}
+  reversal_snipe:
+    enabled: false
+    markets: []
+    params: {}
+  last_second_collapse:
+    enabled: false
+    markets: []
+    params: {}
+  strategy_7:
+    enabled: false
+    markets: []
+    params: {}
+  strategy_8:
+    enabled: false
+    markets: []
+    params: {}
+
+# --- Backtesting ---
+backtest:
+  enabled: false                           # set true to run in backtest mode
+  start_date: "2025-01-01"
+  end_date: "2025-03-01"
+  starting_balance: 10000.0
+  fee_rate_bps: 20                         # Polymarket fee rate in basis points
+  data_cache_dir: "./data/historical"
+  output_dir: "./data/backtest_results"
+  fill_model: "optimistic"                 # "optimistic" or "midpoint"
+
+# --- Logging ---
+logging:
+  level: "info"                            # debug, info, warn, error
+  log_signals: true
+  log_executions: true
+  log_ticks: false
+  output_dir: "./logs"
+  format: "json"
+  max_file_size_mb: 50
+  max_files: 10
+
+# --- Dashboard ---
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+  auth_token: "${DASHBOARD_AUTH_TOKEN}"
+  websocket_push_interval_ms: 500
+  cors_allowed_origins: ["*"]
