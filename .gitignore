@@ -1,0 +1,11 @@
+# Logs
+logs/
+
+# Recorded market data
+data/
+
+# Build output
+polysnipe
+
+# Environment
+.env
