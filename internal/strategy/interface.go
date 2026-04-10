@@ -22,6 +22,8 @@ type Strategy interface {
 	// Configure applies strategy-specific parameters from the config file.
 	Configure(params map[string]interface{}) error
 
-	// Markets returns the list of market IDs this strategy operates on.
-	Markets() []string
+	// Tags returns the list of market tags this strategy wants to trade.
+	// The discovery engine attaches the strategy to any market whose tag set
+	// overlaps with this list (OR logic).
+	Tags() []string
 }

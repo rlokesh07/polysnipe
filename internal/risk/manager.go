@@ -42,8 +42,17 @@ func NewManager(cfg config.RiskConfig, startingBalance decimal.Decimal, log zero
 	}
 }
 
+// CheckWithTags validates a signal using tag-based per-market limits.
+func (m *Manager) CheckWithTags(sig strategy.Signal, strategyID string, size decimal.Decimal, marketTags []string) error {
+	return m.check(sig, strategyID, size, m.marketLimitsForTags(marketTags))
+}
+
 // Check validates a signal before order placement. Returns nil if allowed.
 func (m *Manager) Check(sig strategy.Signal, strategyID string, size decimal.Decimal) error {
+	return m.check(sig, strategyID, size, m.marketLimits(sig.MarketID))
+}
+
+func (m *Manager) check(sig strategy.Signal, strategyID string, size decimal.Decimal, mktLimits config.MarketRiskLimits) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -75,7 +84,6 @@ func (m *Manager) Check(sig strategy.Signal, strategyID string, size decimal.Dec
 	}
 
 	// --- Per-market limits ---
-	mktLimits := m.marketLimits(sig.MarketID)
 	mktExp := m.marketExposure[sig.MarketID]
 	maxMktExp := decimal.NewFromFloat(mktLimits.MaxExposure)
 	if mktExp.Add(size).GreaterThan(maxMktExp) {
@@ -161,10 +169,18 @@ func (m *Manager) Resume() {
 	m.halted = false
 }
 
-func (m *Manager) marketLimits(marketID string) config.MarketRiskLimits {
-	if override, ok := m.cfg.PerMarket.Overrides[marketID]; ok {
-		return override
+// marketLimitsForTags resolves limits for a market identified by its tag set.
+// The first matching tag override wins; falls back to default.
+func (m *Manager) marketLimitsForTags(tags []string) config.MarketRiskLimits {
+	for _, tag := range tags {
+		if override, ok := m.cfg.PerMarket.TagOverrides[tag]; ok {
+			return override
+		}
 	}
+	return m.cfg.PerMarket.Default
+}
+
+func (m *Manager) marketLimits(marketID string) config.MarketRiskLimits {
 	return m.cfg.PerMarket.Default
 }
 

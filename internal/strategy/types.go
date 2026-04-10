@@ -34,6 +34,7 @@ type Signal struct {
 	MarketID   string
 	Direction  Direction
 	Timestamp  time.Time
+	Price      decimal.Decimal // optional: suggested fill price (used by simulated executor)
 }
 
 // PositionStatus represents the current state of a strategy's position.

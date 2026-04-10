@@ -158,20 +158,67 @@ func (f *WSFeed) Close() {
 
 // wsMessage is the raw JSON from Polymarket WebSocket.
 type wsMessage struct {
-	EventType string       `json:"event_type"`
-	AssetID   string       `json:"asset_id"`
-	Price     string       `json:"price"`
-	Side      string       `json:"side"`
-	Size      string       `json:"size"`
-	Timestamp string       `json:"timestamp"`
-	Bids      [][2]string  `json:"bids"`
-	Asks      [][2]string  `json:"asks"`
+	EventType string            `json:"event_type"`
+	AssetID   string            `json:"asset_id"`
+	Market    string            `json:"market"`
+	Price     string            `json:"price"`
+	Side      string            `json:"side"`
+	Size      string            `json:"size"`
+	Timestamp string            `json:"timestamp"`
+	Bids      json.RawMessage   `json:"bids"`
+	Asks      json.RawMessage   `json:"asks"`
+}
+
+// wsPriceLevel is the object form: {"price":"0.5","size":"100"}
+type wsPriceLevel struct {
+	Price string `json:"price"`
+	Size  string `json:"size"`
+}
+
+// parseLevels handles both object form and [price, size] array form.
+func parseLevels(raw json.RawMessage) []OrderBookLevel {
+	if len(raw) == 0 {
+		return nil
+	}
+	// Try object array first: [{"price":"...","size":"..."}, ...]
+	var objs []wsPriceLevel
+	if err := json.Unmarshal(raw, &objs); err == nil {
+		levels := make([]OrderBookLevel, 0, len(objs))
+		for _, o := range objs {
+			p, _ := decimal.NewFromString(o.Price)
+			s, _ := decimal.NewFromString(o.Size)
+			levels = append(levels, OrderBookLevel{Price: p, Size: s})
+		}
+		return levels
+	}
+	// Fall back to [[price, size], ...] array form.
+	var pairs [][2]string
+	if err := json.Unmarshal(raw, &pairs); err == nil {
+		levels := make([]OrderBookLevel, 0, len(pairs))
+		for _, pair := range pairs {
+			p, _ := decimal.NewFromString(pair[0])
+			s, _ := decimal.NewFromString(pair[1])
+			levels = append(levels, OrderBookLevel{Price: p, Size: s})
+		}
+		return levels
+	}
+	return nil
 }
 
 func (f *WSFeed) parseMessage(raw []byte) ([]MarketEvent, error) {
+	return parseRawMessages(raw, f.marketID)
+}
+
+// ParseMessages parses a raw WebSocket message into MarketEvents.
+// If marketID is empty, MarketID on each event is set to the message's asset_id.
+func ParseMessages(raw []byte, marketID string) ([]MarketEvent, error) {
+	return parseRawMessages(raw, marketID)
+}
+
+func parseRawMessages(raw []byte, marketID string) ([]MarketEvent, error) {
 	// Polymarket sends either a single object or an array.
 	var msgs []wsMessage
-	if raw[0] == '[' {
+	if len(raw) > 0 && raw[0] == '[' {
 		if err := json.Unmarshal(raw, &msgs); err != nil {
 			return nil, err
 		}
@@ -185,9 +232,12 @@ func (f *WSFeed) parseMessage(raw []byte) ([]MarketEvent, error) {
 
 	var events []MarketEvent
 	for _, m := range msgs {
-		ev, err := f.convertMessage(m)
+		id := marketID
+		if id == "" {
+			id = m.AssetID
+		}
+		ev, err := convertMsg(m, id)
 		if err != nil {
-			f.log.Debug().Err(err).Msg("skipping unconvertible message")
 			continue
 		}
 		events = append(events, ev)
@@ -195,7 +245,7 @@ func (f *WSFeed) parseMessage(raw []byte) ([]MarketEvent, error) {
 	return events, nil
 }
 
-func (f *WSFeed) convertMessage(m wsMessage) (MarketEvent, error) {
+func convertMsg(m wsMessage, marketID string) (MarketEvent, error) {
 	ts := time.Now()
 	if m.Timestamp != "" {
 		if t, err := time.Parse(time.RFC3339, m.Timestamp); err == nil {
@@ -204,7 +254,7 @@ func (f *WSFeed) convertMessage(m wsMessage) (MarketEvent, error) {
 	}
 
 	ev := MarketEvent{
-		MarketID:  f.marketID,
+		MarketID:  marketID,
 		Timestamp: ts,
 	}
 
@@ -216,16 +266,9 @@ func (f *WSFeed) convertMessage(m wsMessage) (MarketEvent, error) {
 		}
 	case "book", "book_update":
 		ev.EventType = "book_update"
-		var obs OrderBookSnapshot
-		for _, b := range m.Bids {
-			p, _ := decimal.NewFromString(b[0])
-			s, _ := decimal.NewFromString(b[1])
-			obs.Bids = append(obs.Bids, OrderBookLevel{Price: p, Size: s})
-		}
-		for _, a := range m.Asks {
-			p, _ := decimal.NewFromString(a[0])
-			s, _ := decimal.NewFromString(a[1])
-			obs.Asks = append(obs.Asks, OrderBookLevel{Price: p, Size: s})
+		obs := OrderBookSnapshot{
+			Bids: parseLevels(m.Bids),
+			Asks: parseLevels(m.Asks),
 		}
 		ev.OrderBook = obs
 		ev.BestBid = obs.BestBid()

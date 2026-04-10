@@ -14,8 +14,8 @@ import (
 // SpreadThreshold buys the cheaper side when the bid-ask spread exceeds a threshold,
 // and closes when the spread contracts below the exit threshold.
 type SpreadThreshold struct {
-	id      string
-	markets []string
+	id   string
+	tags []string
 
 	// params
 	spreadTriggerBPS int
@@ -37,10 +37,10 @@ func NewSpreadThreshold(id string) *SpreadThreshold {
 	}
 }
 
-func (s *SpreadThreshold) ID() string        { return s.id }
-func (s *SpreadThreshold) Name() string      { return "SpreadThreshold" }
-func (s *SpreadThreshold) Markets() []string { return s.markets }
-func (s *SpreadThreshold) SetMarkets(m []string) { s.markets = m }
+func (s *SpreadThreshold) ID() string      { return s.id }
+func (s *SpreadThreshold) Name() string    { return "SpreadThreshold" }
+func (s *SpreadThreshold) Tags() []string  { return s.tags }
+func (s *SpreadThreshold) SetTags(t []string) { s.tags = t }
 
 func (s *SpreadThreshold) Configure(params map[string]interface{}) error {
 	if v, ok := params["spread_trigger_bps"]; ok {

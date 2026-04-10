@@ -8,16 +8,16 @@ import (
 
 // ReversalSnipe is a stub strategy. Implement your logic here.
 type ReversalSnipe struct {
-	id      string
-	markets []string
+	id   string
+	tags []string
 }
 
 func NewReversalSnipe(id string) *ReversalSnipe { return &ReversalSnipe{id: id} }
 
-func (s *ReversalSnipe) ID() string        { return s.id }
-func (s *ReversalSnipe) Name() string      { return "ReversalSnipe" }
-func (s *ReversalSnipe) Markets() []string { return s.markets }
-func (s *ReversalSnipe) SetMarkets(m []string) { s.markets = m }
+func (s *ReversalSnipe) ID() string      { return s.id }
+func (s *ReversalSnipe) Name() string    { return "ReversalSnipe" }
+func (s *ReversalSnipe) Tags() []string  { return s.tags }
+func (s *ReversalSnipe) SetTags(t []string) { s.tags = t }
 
 func (s *ReversalSnipe) Configure(params map[string]interface{}) error {
 	// TODO: parse strategy-specific params

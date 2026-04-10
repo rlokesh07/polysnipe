@@ -14,8 +14,8 @@ import (
 // Momentum buys after N consecutive price ticks in the same direction,
 // each moving at least M basis points. Exits after a hold duration or on reversal.
 type Momentum struct {
-	id      string
-	markets []string
+	id   string
+	tags []string
 
 	// params
 	consecutiveTicks    int
@@ -46,10 +46,10 @@ func NewMomentum(id string) *Momentum {
 	}
 }
 
-func (s *Momentum) ID() string        { return s.id }
-func (s *Momentum) Name() string      { return "Momentum" }
-func (s *Momentum) Markets() []string { return s.markets }
-func (s *Momentum) SetMarkets(m []string) { s.markets = m }
+func (s *Momentum) ID() string      { return s.id }
+func (s *Momentum) Name() string    { return "Momentum" }
+func (s *Momentum) Tags() []string  { return s.tags }
+func (s *Momentum) SetTags(t []string) { s.tags = t }
 
 func (s *Momentum) Configure(params map[string]interface{}) error {
 	if v, ok := params["consecutive_ticks"]; ok {

@@ -14,8 +14,8 @@ import (
 // TimeDecay fades extreme prices near the end of the contract window.
 // Within the final N seconds, if YES trades above a skew threshold, bet NO (and vice versa).
 type TimeDecay struct {
-	id      string
-	markets []string
+	id   string
+	tags []string
 
 	// params
 	triggerRemainingSeconds int
@@ -35,10 +35,10 @@ func NewTimeDecay(id string) *TimeDecay {
 	}
 }
 
-func (s *TimeDecay) ID() string        { return s.id }
-func (s *TimeDecay) Name() string      { return "TimeDecay" }
-func (s *TimeDecay) Markets() []string { return s.markets }
-func (s *TimeDecay) SetMarkets(m []string) { s.markets = m }
+func (s *TimeDecay) ID() string      { return s.id }
+func (s *TimeDecay) Name() string    { return "TimeDecay" }
+func (s *TimeDecay) Tags() []string  { return s.tags }
+func (s *TimeDecay) SetTags(t []string) { s.tags = t }
 
 func (s *TimeDecay) Configure(params map[string]interface{}) error {
 	if v, ok := params["trigger_remaining_seconds"]; ok {
@@ -96,8 +96,8 @@ func (s *TimeDecay) Run(ctx context.Context, snapshotCh <-chan state.MarketSnaps
 				continue
 			}
 
-			// Only act in final window.
-			if snap.TimeRemaining > trigger || snap.TimeRemaining <= 0 {
+			// Only act in final window (skipped when trigger is 0).
+			if trigger > 0 && (snap.TimeRemaining > trigger || snap.TimeRemaining <= 0) {
 				continue
 			}
 
@@ -110,25 +110,26 @@ func (s *TimeDecay) Run(ctx context.Context, snapshotCh <-chan state.MarketSnaps
 				continue
 			}
 
+			// Buy whichever side is above the threshold.
 			var dir Direction
-			var triggered bool
-
+			var contractPrice decimal.Decimal
 			if mid.GreaterThanOrEqual(threshold) {
-				// YES is overbought — bet NO.
-				dir = BuyNo
-				triggered = true
-			} else if mid.LessThanOrEqual(antiThreshold) {
-				// NO is overbought — bet YES.
 				dir = BuyYes
-				triggered = true
+				contractPrice = mid
+			} else if mid.LessThanOrEqual(antiThreshold) {
+				dir = BuyNo
+				contractPrice = decimal.NewFromFloat(1.0).Sub(mid)
+			} else {
+				continue
 			}
 
-			if triggered {
+			{
 				sig := Signal{
 					StrategyID: s.id,
 					MarketID:   snap.MarketID,
 					Direction:  dir,
 					Timestamp:  time.Now(),
+					Price:      contractPrice,
 				}
 				select {
 				case signalCh <- sig:

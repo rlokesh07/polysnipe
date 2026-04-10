@@ -19,8 +19,10 @@ import (
 	"polysnipe/internal/backtest"
 	"polysnipe/internal/config"
 	"polysnipe/internal/dashboard"
+	"polysnipe/internal/discovery"
 	"polysnipe/internal/executor"
 	"polysnipe/internal/feed"
+	"polysnipe/internal/gamma"
 	"polysnipe/internal/risk"
 	"polysnipe/internal/sizing"
 	"polysnipe/internal/state"
@@ -43,7 +45,6 @@ func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to config file")
 	flag.Parse()
 
-	// Load config.
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -54,7 +55,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set up logger.
 	logger := buildLogger(cfg.Logging)
 	log.Logger = logger
 
@@ -89,15 +89,51 @@ func runBacktest(cfg *config.Config, logger zerolog.Logger) {
 
 // --- Live trading mode ---
 
+// MarketStack holds all goroutine state for a single discovered market.
+type MarketStack struct {
+	MarketID     string
+	Question     string
+	Tags         []string
+	Strategies   []string
+	SubscribedAt time.Time
+	Cancel       context.CancelFunc
+	Done         chan struct{}
+
+	priceMu   sync.Mutex
+	lastPrice float64
+	bestBid   float64
+	bestAsk   float64
+}
+
+func (ms *MarketStack) setPrice(snap state.MarketSnapshot) {
+	ms.priceMu.Lock()
+	ms.lastPrice, _ = snap.LastPrice.Float64()
+	ms.bestBid, _ = snap.BestBid.Float64()
+	ms.bestAsk, _ = snap.BestAsk.Float64()
+	ms.priceMu.Unlock()
+}
+
+func (ms *MarketStack) getPrice() (lastPrice, bestBid, bestAsk float64) {
+	ms.priceMu.Lock()
+	defer ms.priceMu.Unlock()
+	return ms.lastPrice, ms.bestBid, ms.bestAsk
+}
+
+// orchestrator manages the dynamic market lifecycle.
 type orchestrator struct {
 	cfg       *config.Config
 	startTime time.Time
 	lastErr   string
 
-	mu              sync.Mutex
+	mu               sync.Mutex
 	pausedStrategies map[string]bool
-	exec            executor.Executor
-	riskMgr         *risk.Manager
+	exec             executor.Executor
+	riskMgr          *risk.Manager
+
+	// dynamic market registry
+	registryMu sync.RWMutex
+	registry   map[string]*MarketStack // conditionID → stack
+	questions  map[string]string       // conditionID → human-readable question
 }
 
 func (o *orchestrator) Positions() []executor.Position { return o.exec.Positions() }
@@ -124,12 +160,57 @@ func (o *orchestrator) LastError() string {
 	defer o.mu.Unlock()
 	return o.lastErr
 }
+func (o *orchestrator) Balance() float64 {
+	if sim, ok := o.exec.(*executor.SimulatedExecutor); ok {
+		v, _ := sim.Balance().Float64()
+		return v
+	}
+	return 0
+}
+
+func (o *orchestrator) RecentFills() []executor.Fill {
+	sim, ok := o.exec.(*executor.SimulatedExecutor)
+	if !ok {
+		return nil
+	}
+	fills := sim.Fills()
+	o.registryMu.RLock()
+	defer o.registryMu.RUnlock()
+	for i := range fills {
+		if q, ok := o.questions[fills[i].MarketID]; ok {
+			fills[i].Question = q
+		}
+	}
+	return fills
+}
+
+func (o *orchestrator) IsDryRun() bool { return o.cfg.DryRun }
+
+func (o *orchestrator) ActiveMarkets() []dashboard.MarketStackInfo {
+	o.registryMu.RLock()
+	defer o.registryMu.RUnlock()
+	out := make([]dashboard.MarketStackInfo, 0, len(o.registry))
+	for _, ms := range o.registry {
+		lastPrice, bestBid, bestAsk := ms.getPrice()
+		out = append(out, dashboard.MarketStackInfo{
+			MarketID:     ms.MarketID,
+			Question:     ms.Question,
+			Tags:         ms.Tags,
+			Strategies:   ms.Strategies,
+			SubscribedAt: ms.SubscribedAt,
+			LastPrice:    lastPrice,
+			BestBid:      bestBid,
+			BestAsk:      bestAsk,
+		})
+	}
+	return out
+}
 
 func runLive(cfg *config.Config, logger zerolog.Logger) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	balance := decimal.NewFromFloat(1000.0) // TODO: fetch from wallet
+	balance := decimal.NewFromFloat(cfg.DryRunBalance) // set via dry_run_balance in config.yaml
 
 	riskMgr := risk.NewManager(cfg.Risk, balance, logger)
 
@@ -140,9 +221,25 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		sizer = sizing.NewFixedSizer(cfg.Sizing)
 	}
 
-	liveExec, err := executor.NewLiveExecutor(cfg.Execution, cfg.Connection, riskMgr, sizer, balance, logger)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("create executor")
+	var liveExec executor.Executor
+	if cfg.DryRun {
+		logger.Warn().Msg("DRY RUN mode: using simulated executor — no real orders will be placed")
+		liveExec = executor.NewSimulatedExecutor(
+			cfg.Execution,
+			cfg.Sizing,
+			riskMgr,
+			sizer,
+			balance,
+			0,          // no fees in dry run
+			"midpoint", // fill at 0.5 mid
+			logger,
+		)
+	} else {
+		live, err := executor.NewLiveExecutor(cfg.Execution, cfg.Connection, riskMgr, sizer, balance, logger)
+		if err != nil {
+			logger.Fatal().Err(err).Msg("create executor")
+		}
+		liveExec = live
 	}
 
 	orch := &orchestrator{
@@ -151,6 +248,8 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		pausedStrategies: make(map[string]bool),
 		exec:             liveExec,
 		riskMgr:          riskMgr,
+		registry:         make(map[string]*MarketStack),
+		questions:        make(map[string]string),
 	}
 
 	strategies, err := buildStrategies(cfg)
@@ -158,37 +257,13 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		logger.Fatal().Err(err).Msg("build strategies")
 	}
 
-	// Build channels.
-	signalCh := make(chan strategy.Signal, 16)
+	// Shared signal channel for all markets.
+	signalCh := make(chan strategy.Signal, 64)
+
+	// Feedback channels per strategy (live for the bot lifetime).
 	feedbackChs := make(map[string]chan strategy.PositionUpdate)
 	for _, strat := range strategies {
-		feedbackChs[strat.ID()] = make(chan strategy.PositionUpdate, 1)
-	}
-
-	// Build market feed channels and state engines.
-	marketFeedChs := make(map[string]chan feed.MarketEvent)
-	engines := make(map[string]*state.Engine)
-	windowEnd := time.Now().Add(5 * time.Minute) // rough default; update per market
-
-	for _, mktCfg := range cfg.Markets {
-		ch := make(chan feed.MarketEvent, 64)
-		marketFeedChs[mktCfg.ID] = ch
-
-		eng := state.NewEngine(mktCfg.ID, windowEnd, logger)
-		engines[mktCfg.ID] = eng
-
-		// Subscribe each strategy that cares about this market.
-		for _, strat := range strategies {
-			for _, mID := range strat.Markets() {
-				if mID == mktCfg.ID {
-					snapCh := make(chan state.MarketSnapshot, 1)
-					eng.Subscribe(snapCh)
-					// Run strategy goroutine for this market.
-					go strat.Run(ctx, snapCh, feedbackChs[strat.ID()], signalCh)
-					break
-				}
-			}
-		}
+		feedbackChs[strat.ID()] = make(chan strategy.PositionUpdate, 4)
 	}
 
 	var wg sync.WaitGroup
@@ -200,29 +275,181 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		liveExec.Run(ctx, signalCh, feedbackChs)
 	}()
 
-	// Start state engines.
-	for mktID, eng := range engines {
-		wg.Add(1)
-		go func(e *state.Engine, ch <-chan feed.MarketEvent) {
-			defer wg.Done()
-			e.Run(ctx, ch)
-		}(eng, marketFeedChs[mktID])
-	}
-
-	// Start WebSocket feeds.
 	reconnectCfg := feed.ReconnectConfig{
 		MaxRetries:    cfg.Connection.ReconnectMaxRetries,
 		BackoffBaseMS: cfg.Connection.ReconnectBackoffBaseMS,
 		BackoffMaxMS:  cfg.Connection.ReconnectBackoffMaxMS,
 	}
-	for _, mktCfg := range cfg.Markets {
-		mktCfg := mktCfg
-		tokenIDs := []string{mktCfg.TokenIDYes, mktCfg.TokenIDNo}
-		wsFeed := feed.NewWSFeed(cfg.Connection.WebSocketURL, mktCfg.ID, tokenIDs, reconnectCfg, marketFeedChs[mktCfg.ID], logger)
+
+	// Single shared WebSocket connection for all markets.
+	sharedFeed := feed.NewSharedFeed(cfg.Connection.WebSocketURL, reconnectCfg, logger)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sharedFeed.Run(ctx)
+	}()
+
+	// subscribeMarket spins up a state engine + strategy goroutines for one market.
+	subscribeMarket := func(cmd discovery.MarketCommand) {
+		mktID := cmd.Market.ConditionID
+		mktCtx, mktCancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+
+		stack := &MarketStack{
+			MarketID:     mktID,
+			Question:     cmd.Market.Question,
+			Tags:         cmd.Market.Tags,
+			Strategies:   cmd.Strategies,
+			SubscribedAt: time.Now(),
+			Cancel:       mktCancel,
+			Done:         done,
+		}
+
+		orch.registryMu.Lock()
+		orch.registry[mktID] = stack
+		orch.questions[mktID] = cmd.Market.Question
+		orch.registryMu.Unlock()
+
+		// Rough window end — strategies update internally; this just seeds the engine.
+		windowEnd := time.Now().Add(24 * time.Hour)
+		eng := state.NewEngine(mktID, windowEnd, logger)
+
+		// Price tracker: keep latest snapshot on the stack for the dashboard.
+		priceCh := make(chan state.MarketSnapshot, 1)
+		eng.Subscribe(priceCh)
+		go func() {
+			for snap := range priceCh {
+				stack.setPrice(snap)
+			}
+		}()
+
+		// Subscribe matching strategies.
+		for _, stratID := range cmd.Strategies {
+			var strat strategy.Strategy
+			for _, s := range strategies {
+				if s.ID() == stratID {
+					strat = s
+					break
+				}
+			}
+			if strat == nil {
+				continue
+			}
+			snapCh := make(chan state.MarketSnapshot, 4)
+			eng.Subscribe(snapCh)
+			fbCh := feedbackChs[stratID]
+			go strat.Run(mktCtx, snapCh, fbCh, signalCh)
+		}
+
+		rawFeedCh := make(chan feed.MarketEvent, 64)
+		sharedFeed.Subscribe(mktID, cmd.Market.TokenIDYes, cmd.Market.TokenIDNo, rawFeedCh)
+
+		// Tee events to disk for future backtesting, then forward to state engine.
+		feedCh := make(chan feed.MarketEvent, 64)
+		if rec, err := feed.NewRecorder(cfg.Backtest.DataCacheDir, mktID); err != nil {
+			logger.Warn().Err(err).Str("market_id", mktID).Msg("recorder failed; events will not be saved")
+			go func() {
+				for ev := range rawFeedCh {
+					feedCh <- ev
+				}
+				close(feedCh)
+			}()
+		} else {
+			logger.Info().Str("path", rec.Path()).Str("market_id", mktID).Msg("recording market events")
+			go func() {
+				for ev := range rawFeedCh {
+					rec.Record(ev)
+					feedCh <- ev
+				}
+				close(feedCh)
+				rec.Close()
+			}()
+		}
+
+		var mktWg sync.WaitGroup
+		mktWg.Add(1)
+		go func() {
+			defer mktWg.Done()
+			eng.Run(mktCtx, feedCh)
+		}()
+
+		// Close Done when all goroutines have exited.
+		go func() {
+			mktWg.Wait()
+			close(done)
+		}()
+
+		logger.Info().
+			Str("event", "market_subscribed").
+			Str("market_id", mktID).
+			Str("question", cmd.Market.Question).
+			Strs("strategies_attached", cmd.Strategies).
+			Msg("market subscribed")
+	}
+
+	// unsubscribeMarket tears down the goroutine stack for a market.
+	unsubscribeMarket := func(marketID string) {
+		orch.registryMu.Lock()
+		stack, ok := orch.registry[marketID]
+		if ok {
+			delete(orch.registry, marketID)
+			delete(orch.questions, marketID)
+		}
+		orch.registryMu.Unlock()
+
+		if !ok {
+			return
+		}
+
+		stack.Cancel()
+		sharedFeed.Unsubscribe(marketID)
+
+		// Attempt to close any open positions for this market.
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutCancel()
+		if sim, ok := liveExec.(*executor.SimulatedExecutor); ok {
+			lastPrice, _, _ := stack.getPrice()
+			price := decimal.NewFromFloat(lastPrice)
+			if err := sim.CloseMarketAtPrice(shutCtx, marketID, price); err != nil {
+				logger.Error().Err(err).Str("market_id", marketID).Msg("close market positions on teardown")
+			}
+		} else if err := liveExec.CloseMarket(shutCtx, marketID); err != nil {
+			logger.Error().Err(err).Str("market_id", marketID).Msg("close market positions on teardown")
+		}
+
+		select {
+		case <-stack.Done:
+		case <-time.After(15 * time.Second):
+			logger.Warn().Str("market_id", marketID).Msg("market teardown timed out")
+		}
+
+		logger.Info().
+			Str("event", "market_teardown").
+			Str("market_id", marketID).
+			Msg("market torn down")
+	}
+
+	// Start discovery engine if enabled.
+	commandCh := make(chan discovery.MarketCommand, 16)
+
+	if cfg.Discovery.Enabled {
+		gammaClient := gamma.NewClient(cfg.Discovery.GammaAPIURL, cfg.Discovery.RateLimitPerSecond)
+		watchlists := buildWatchlists(cfg)
+		pollInterval := time.Duration(cfg.Discovery.PollIntervalSec) * time.Second
+		if pollInterval <= 0 {
+			pollInterval = 60 * time.Second
+		}
+
+		discoveryStrategies := make([]discovery.Strategy, len(strategies))
+		for i, s := range strategies {
+			discoveryStrategies[i] = s
+		}
+
+		eng := discovery.NewEngine(gammaClient, watchlists, discoveryStrategies, commandCh, pollInterval, logger)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			wsFeed.Run(ctx)
+			eng.Run(ctx)
 		}()
 	}
 
@@ -238,13 +465,48 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		}()
 	}
 
-	logger.Info().Int("strategies", len(strategies)).Int("markets", len(cfg.Markets)).Msg("bot running")
+	logger.Info().
+		Int("strategies", len(strategies)).
+		Bool("discovery", cfg.Discovery.Enabled).
+		Bool("dry_run", cfg.DryRun).
+		Msg("bot running")
+
+	// Main loop: read market commands from the discovery engine.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case cmd, ok := <-commandCh:
+				if !ok {
+					return
+				}
+				switch cmd.Action {
+				case discovery.Subscribe:
+					orch.registryMu.RLock()
+					_, already := orch.registry[cmd.Market.ConditionID]
+					orch.registryMu.RUnlock()
+					if !already {
+						subscribeMarket(cmd)
+					}
+				case discovery.Unsubscribe:
+					unsubscribeMarket(cmd.Market.ConditionID)
+				}
+			}
+		}
+	}()
 
 	// Wait for shutdown signal.
 	<-ctx.Done()
 	logger.Info().Msg("shutdown signal received; beginning graceful shutdown")
 
-	// Shutdown sequence (spec §Shutdown Sequence).
+	// Cancel all market stacks.
+	orch.registryMu.Lock()
+	for _, stack := range orch.registry {
+		stack.Cancel()
+	}
+	orch.registryMu.Unlock()
+
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutCancel()
 
@@ -259,6 +521,27 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 	logger.Info().Msg("PolySnipe stopped cleanly")
 }
 
+// buildWatchlists converts config watchlists to discovery.Watchlist values.
+func buildWatchlists(cfg *config.Config) []discovery.Watchlist {
+	out := make([]discovery.Watchlist, 0, len(cfg.Discovery.Watchlists))
+	for _, wl := range cfg.Discovery.Watchlists {
+		out = append(out, discovery.Watchlist{
+			Name: wl.Name,
+			Tags: wl.Tags,
+			Filters: discovery.PropertyFilters{
+				MaxExpiryMinutes: wl.Filters.MaxExpiryMinutes,
+				MinExpiryMinutes: wl.Filters.MinExpiryMinutes,
+				OutcomeType:      wl.Filters.OutcomeType,
+				MinVolume24h:     wl.Filters.MinVolume24h,
+				MinLiquidity:     wl.Filters.MinLiquidity,
+				Active:           wl.Filters.Active,
+				TitleContains:    wl.Filters.TitleContains,
+			},
+		})
+	}
+	return out
+}
+
 // buildStrategies instantiates enabled strategies from config.
 func buildStrategies(cfg *config.Config) ([]strategy.Strategy, error) {
 	var strategies []strategy.Strategy
@@ -271,16 +554,11 @@ func buildStrategies(cfg *config.Config) ([]strategy.Strategy, error) {
 			return nil, fmt.Errorf("unknown strategy: %s", name)
 		}
 		strat := factory(name)
-		// Set markets.
 		if err := strat.Configure(stratCfg.Params); err != nil {
 			return nil, fmt.Errorf("configure strategy %s: %w", name, err)
 		}
-		// We need to set the markets on the strategy.
-		// The interface doesn't have a SetMarkets method; we handle this through Configure.
-		// Each concrete type stores markets — inject via the Markets() return slice by calling
-		// a type-assertion pattern or via a setter interface.
-		if ms, ok := strat.(interface{ SetMarkets([]string) }); ok {
-			ms.SetMarkets(stratCfg.Markets)
+		if ts, ok := strat.(interface{ SetTags([]string) }); ok {
+			ts.SetTags(stratCfg.Tags)
 		}
 		strategies = append(strategies, strat)
 	}

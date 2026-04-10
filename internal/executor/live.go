@@ -308,6 +308,29 @@ func (e *LiveExecutor) CancelAll(ctx context.Context) error {
 	return nil
 }
 
+// CloseMarket closes all open positions for a specific market.
+func (e *LiveExecutor) CloseMarket(ctx context.Context, marketID string) error {
+	positions := e.ledger.OpenPositions()
+	for _, pos := range positions {
+		if pos.MarketID != marketID {
+			continue
+		}
+		sig := strategy.Signal{
+			StrategyID: pos.StrategyID,
+			MarketID:   pos.MarketID,
+			Direction:  strategy.Close,
+			Timestamp:  time.Now(),
+		}
+		if err := e.placeCloseOrder(ctx, sig); err != nil {
+			e.log.Error().Err(err).
+				Str("strategy", pos.StrategyID).
+				Str("market", pos.MarketID).
+				Msg("close position failed during market teardown")
+		}
+	}
+	return nil
+}
+
 // CloseAll closes all open positions.
 func (e *LiveExecutor) CloseAll(ctx context.Context) error {
 	positions := e.ledger.OpenPositions()

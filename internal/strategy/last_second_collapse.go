@@ -8,16 +8,16 @@ import (
 
 // LastSecondCollapse is a stub strategy. Implement your logic here.
 type LastSecondCollapse struct {
-	id      string
-	markets []string
+	id   string
+	tags []string
 }
 
 func NewLastSecondCollapse(id string) *LastSecondCollapse { return &LastSecondCollapse{id: id} }
 
-func (s *LastSecondCollapse) ID() string        { return s.id }
-func (s *LastSecondCollapse) Name() string      { return "LastSecondCollapse" }
-func (s *LastSecondCollapse) Markets() []string { return s.markets }
-func (s *LastSecondCollapse) SetMarkets(m []string) { s.markets = m }
+func (s *LastSecondCollapse) ID() string      { return s.id }
+func (s *LastSecondCollapse) Name() string    { return "LastSecondCollapse" }
+func (s *LastSecondCollapse) Tags() []string  { return s.tags }
+func (s *LastSecondCollapse) SetTags(t []string) { s.tags = t }
 
 func (s *LastSecondCollapse) Configure(params map[string]interface{}) error {
 	// TODO: parse strategy-specific params

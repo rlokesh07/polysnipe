@@ -7,35 +7,56 @@ import (
 )
 
 type Config struct {
-	Connection ConnectionConfig           `yaml:"connection"`
-	Markets    []MarketConfig             `yaml:"markets"`
-	Execution  ExecutionConfig            `yaml:"execution"`
-	Sizing     SizingConfig               `yaml:"sizing"`
-	Risk       RiskConfig                 `yaml:"risk"`
-	Strategies map[string]StrategyConfig  `yaml:"strategies"`
-	Backtest   BacktestConfig             `yaml:"backtest"`
-	Logging    LoggingConfig              `yaml:"logging"`
-	Dashboard  DashboardConfig            `yaml:"dashboard"`
+	Connection ConnectionConfig          `yaml:"connection"`
+	Discovery  DiscoveryConfig           `yaml:"discovery"`
+	DryRun        bool    `yaml:"dry_run"`
+	DryRunBalance float64 `yaml:"dry_run_balance"`
+	Execution  ExecutionConfig           `yaml:"execution"`
+	Sizing     SizingConfig              `yaml:"sizing"`
+	Risk       RiskConfig                `yaml:"risk"`
+	Strategies map[string]StrategyConfig `yaml:"strategies"`
+	Backtest   BacktestConfig            `yaml:"backtest"`
+	Logging    LoggingConfig             `yaml:"logging"`
+	Dashboard  DashboardConfig           `yaml:"dashboard"`
 }
 
 type ConnectionConfig struct {
-	WebSocketURL          string `yaml:"websocket_url"`
-	RESTBaseURL           string `yaml:"rest_base_url"`
-	APIKey                string `yaml:"api_key"`
-	APISecret             string `yaml:"api_secret"`
-	Passphrase            string `yaml:"passphrase"`
-	ReconnectMaxRetries   int    `yaml:"reconnect_max_retries"`
-	ReconnectBackoffBaseMS int   `yaml:"reconnect_backoff_base_ms"`
-	ReconnectBackoffMaxMS  int   `yaml:"reconnect_backoff_max_ms"`
-	RequestTimeoutMS      int    `yaml:"request_timeout_ms"`
+	WebSocketURL           string `yaml:"websocket_url"`
+	RESTBaseURL            string `yaml:"rest_base_url"`
+	APIKey                 string `yaml:"api_key"`
+	APISecret              string `yaml:"api_secret"`
+	Passphrase             string `yaml:"passphrase"`
+	ReconnectMaxRetries    int    `yaml:"reconnect_max_retries"`
+	ReconnectBackoffBaseMS int    `yaml:"reconnect_backoff_base_ms"`
+	ReconnectBackoffMaxMS  int    `yaml:"reconnect_backoff_max_ms"`
+	RequestTimeoutMS       int    `yaml:"request_timeout_ms"`
 }
 
-type MarketConfig struct {
-	ID          string `yaml:"id"`
-	ConditionID string `yaml:"condition_id"`
-	TokenIDYes  string `yaml:"token_id_yes"`
-	TokenIDNo   string `yaml:"token_id_no"`
-	Label       string `yaml:"label"`
+// DiscoveryConfig controls the market discovery engine.
+type DiscoveryConfig struct {
+	Enabled            bool              `yaml:"enabled"`
+	PollIntervalSec    int               `yaml:"poll_interval_seconds"`
+	GammaAPIURL        string            `yaml:"gamma_api_url"`
+	RateLimitPerSecond int               `yaml:"rate_limit_per_second"`
+	Watchlists         []WatchlistConfig `yaml:"watchlists"`
+}
+
+// WatchlistConfig is a single watchlist definition from config.
+type WatchlistConfig struct {
+	Name    string           `yaml:"name"`
+	Tags    []string         `yaml:"tags"`
+	Filters WatchlistFilters `yaml:"filters"`
+}
+
+// WatchlistFilters mirrors PropertyFilters for YAML parsing.
+type WatchlistFilters struct {
+	MaxExpiryMinutes *int     `yaml:"max_expiry_minutes"`
+	MinExpiryMinutes *int     `yaml:"min_expiry_minutes"`
+	OutcomeType      *string  `yaml:"outcome_type"`
+	MinVolume24h     *float64 `yaml:"min_volume_24h"`
+	MinLiquidity     *float64 `yaml:"min_liquidity"`
+	Active           bool     `yaml:"active"`
+	TitleContains    string   `yaml:"title_contains"`
 }
 
 type ExecutionConfig struct {
@@ -77,8 +98,8 @@ type MarketRiskLimits struct {
 }
 
 type PerMarketRiskConfig struct {
-	Default   MarketRiskLimits            `yaml:"default"`
-	Overrides map[string]MarketRiskLimits `yaml:"overrides"`
+	Default      MarketRiskLimits            `yaml:"default"`
+	TagOverrides map[string]MarketRiskLimits `yaml:"tag_overrides"`
 }
 
 type StrategyRiskLimits struct {
@@ -93,7 +114,7 @@ type PerStrategyRiskConfig struct {
 
 type StrategyConfig struct {
 	Enabled bool                   `yaml:"enabled"`
-	Markets []string               `yaml:"markets"`
+	Tags    []string               `yaml:"tags"`
 	Params  map[string]interface{} `yaml:"params"`
 }
 
@@ -120,12 +141,12 @@ type LoggingConfig struct {
 }
 
 type DashboardConfig struct {
-	Enabled                bool     `yaml:"enabled"`
-	Host                   string   `yaml:"host"`
-	Port                   int      `yaml:"port"`
-	AuthToken              string   `yaml:"auth_token"`
-	WebSocketPushIntervalMS int     `yaml:"websocket_push_interval_ms"`
-	CORSAllowedOrigins     []string `yaml:"cors_allowed_origins"`
+	Enabled                 bool     `yaml:"enabled"`
+	Host                    string   `yaml:"host"`
+	Port                    int      `yaml:"port"`
+	AuthToken               string   `yaml:"auth_token"`
+	WebSocketPushIntervalMS int      `yaml:"websocket_push_interval_ms"`
+	CORSAllowedOrigins      []string `yaml:"cors_allowed_origins"`
 }
 
 // Load reads a config file and expands environment variables.

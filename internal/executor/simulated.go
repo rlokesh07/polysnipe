@@ -20,10 +20,12 @@ type Fill struct {
 	OrderID    string
 	StrategyID string
 	MarketID   string
+	Question   string // human-readable market question
 	Side       strategy.Direction
 	Price      decimal.Decimal
 	Size       decimal.Decimal
 	Fee        decimal.Decimal
+	PnL        decimal.Decimal // non-zero on close fills
 	Timestamp  time.Time
 }
 
@@ -49,7 +51,7 @@ type SimulatedExecutor struct {
 	feedbackChs map[string]chan strategy.PositionUpdate
 
 	// backtest outputs
-	Fills           []Fill
+	fills           []Fill
 	RejectedSignals []RejectedSignal
 
 	nextOrderID int64
@@ -166,7 +168,7 @@ func (e *SimulatedExecutor) simulateEntry(sig strategy.Signal, size decimal.Deci
 		Timestamp:  sig.Timestamp,
 	}
 	e.mu.Lock()
-	e.Fills = append(e.Fills, fill)
+	e.fills = append(e.fills, fill)
 	e.mu.Unlock()
 
 	e.log.Debug().
@@ -198,14 +200,22 @@ func (e *SimulatedExecutor) simulateClose(sig strategy.Signal) {
 	closePrice := e.simulateFillPrice(sig)
 	fee := pos.Size.Mul(decimal.NewFromFloat(float64(e.feeRateBPS) / 10000.0))
 
-	// Compute P&L.
-	var pnl decimal.Decimal
+	// Compute P&L using contract math:
+	//   contracts = size / entryPrice
+	//   proceeds  = contracts × closePriceForSide
+	//   pnl       = proceeds - cost - fee
+	//
+	// For BuyNo, entryPrice is the NO price (1 - YES mid) and
+	// closePriceForSide is the current NO price (1 - YES close).
+	one := decimal.NewFromFloat(1.0)
+	var closePriceForSide decimal.Decimal
 	if pos.Side == strategy.BuyYes {
-		pnl = closePrice.Sub(pos.EntryPrice).Mul(pos.Size)
+		closePriceForSide = closePrice
 	} else {
-		pnl = pos.EntryPrice.Sub(closePrice).Mul(pos.Size)
+		closePriceForSide = one.Sub(closePrice)
 	}
-	pnl = pnl.Sub(fee)
+	contracts := pos.Size.Div(pos.EntryPrice)
+	pnl := contracts.Mul(closePriceForSide).Sub(pos.Size).Sub(fee)
 
 	e.mu.Lock()
 	e.balance = e.balance.Add(pos.Size).Add(pnl)
@@ -226,10 +236,11 @@ func (e *SimulatedExecutor) simulateClose(sig strategy.Signal) {
 		Price:      closePrice,
 		Size:       pos.Size,
 		Fee:        fee,
+		PnL:        pnl,
 		Timestamp:  sig.Timestamp,
 	}
 	e.mu.Lock()
-	e.Fills = append(e.Fills, fill)
+	e.fills = append(e.fills, fill)
 	e.mu.Unlock()
 
 	e.ledger.ClosePosition(sig.StrategyID, sig.MarketID)
@@ -245,16 +256,42 @@ func (e *SimulatedExecutor) simulateClose(sig strategy.Signal) {
 	})
 }
 
-// simulateFillPrice returns the fill price based on the fill model.
-// In a real backtest, this would use the snapshot at signal time.
+// simulateFillPrice returns the fill price for a signal.
+// Uses Signal.Price when provided, otherwise falls back to 0.5.
 func (e *SimulatedExecutor) simulateFillPrice(sig strategy.Signal) decimal.Decimal {
-	// Both fill models use 0.5 as a default since we don't carry market state here.
-	// The runner should inject the current mid price for more accurate simulation.
+	if sig.Price.IsPositive() {
+		return sig.Price
+	}
 	return decimal.NewFromFloat(0.5)
 }
 
 // CancelAll is a no-op in simulation (all orders fill immediately).
 func (e *SimulatedExecutor) CancelAll(_ context.Context) error { return nil }
+
+// CloseMarket closes all open positions in a specific market in simulation.
+func (e *SimulatedExecutor) CloseMarket(_ context.Context, marketID string) error {
+	return e.CloseMarketAtPrice(context.Background(), marketID, decimal.Zero)
+}
+
+// CloseMarketAtPrice closes all open positions for a market using the given price.
+// Pass a zero price to fall back to the default 0.5 fill model.
+func (e *SimulatedExecutor) CloseMarketAtPrice(_ context.Context, marketID string, price decimal.Decimal) error {
+	positions := e.ledger.OpenPositions()
+	for _, pos := range positions {
+		if pos.MarketID != marketID {
+			continue
+		}
+		sig := strategy.Signal{
+			StrategyID: pos.StrategyID,
+			MarketID:   pos.MarketID,
+			Direction:  strategy.Close,
+			Timestamp:  time.Now(),
+			Price:      price,
+		}
+		e.simulateClose(sig)
+	}
+	return nil
+}
 
 // CloseAll closes all remaining open positions in simulation.
 func (e *SimulatedExecutor) CloseAll(_ context.Context) error {
@@ -281,6 +318,15 @@ func (e *SimulatedExecutor) Balance() decimal.Decimal {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.balance
+}
+
+// Fills returns a copy of all recorded fills.
+func (e *SimulatedExecutor) Fills() []Fill {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]Fill, len(e.fills))
+	copy(out, e.fills)
+	return out
 }
 
 func (e *SimulatedExecutor) sendFeedback(strategyID string, update strategy.PositionUpdate) {

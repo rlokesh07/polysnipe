@@ -87,7 +87,7 @@ func (r *Reporter) Write(sim *executor.SimulatedExecutor, startingBalance decima
 		return fmt.Errorf("create output dir: %w", err)
 	}
 
-	fills := sim.Fills
+	fills := sim.Fills()
 	rejected := sim.RejectedSignals
 	endBalance := sim.Balance()
 

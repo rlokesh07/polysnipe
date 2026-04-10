@@ -8,16 +8,16 @@ import (
 
 // Strategy8 is a stub strategy. Implement your logic here.
 type Strategy8 struct {
-	id      string
-	markets []string
+	id   string
+	tags []string
 }
 
 func NewStrategy8(id string) *Strategy8 { return &Strategy8{id: id} }
 
-func (s *Strategy8) ID() string        { return s.id }
-func (s *Strategy8) Name() string      { return "Strategy8" }
-func (s *Strategy8) Markets() []string { return s.markets }
-func (s *Strategy8) SetMarkets(m []string) { s.markets = m }
+func (s *Strategy8) ID() string      { return s.id }
+func (s *Strategy8) Name() string    { return "Strategy8" }
+func (s *Strategy8) Tags() []string  { return s.tags }
+func (s *Strategy8) SetTags(t []string) { s.tags = t }
 
 func (s *Strategy8) Configure(params map[string]interface{}) error {
 	// TODO: parse strategy-specific params

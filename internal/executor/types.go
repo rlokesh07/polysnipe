@@ -67,6 +67,9 @@ type Executor interface {
 	// CloseAll places close orders for all open positions and waits for fills (with timeout).
 	CloseAll(ctx context.Context) error
 
+	// CloseMarket closes all open positions in the given market.
+	CloseMarket(ctx context.Context, marketID string) error
+
 	// Positions returns a snapshot of all current positions.
 	Positions() []Position
 }

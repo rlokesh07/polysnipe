@@ -10,12 +10,15 @@ func (c *Config) Validate() error {
 	if c.Connection.RESTBaseURL == "" {
 		return fmt.Errorf("connection.rest_base_url is required")
 	}
-	if len(c.Markets) == 0 {
-		return fmt.Errorf("at least one market must be configured")
+	if c.DryRun && c.DryRunBalance <= 0 {
+		return fmt.Errorf("dry_run_balance must be positive when dry_run is enabled")
 	}
-	for i, m := range c.Markets {
-		if m.ID == "" {
-			return fmt.Errorf("markets[%d].id is required", i)
+	if c.Discovery.Enabled {
+		if c.Discovery.GammaAPIURL == "" {
+			return fmt.Errorf("discovery.gamma_api_url is required when discovery is enabled")
+		}
+		if len(c.Discovery.Watchlists) == 0 {
+			return fmt.Errorf("at least one watchlist must be configured when discovery is enabled")
 		}
 	}
 	if c.Execution.OrderType != "limit" {
@@ -49,16 +52,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Dashboard.Enabled && c.Dashboard.Port == 0 {
 		return fmt.Errorf("dashboard.port is required when dashboard is enabled")
-	}
-	return nil
-}
-
-// MarketByID returns the MarketConfig for the given ID, or nil if not found.
-func (c *Config) MarketByID(id string) *MarketConfig {
-	for i := range c.Markets {
-		if c.Markets[i].ID == id {
-			return &c.Markets[i]
-		}
 	}
 	return nil
 }

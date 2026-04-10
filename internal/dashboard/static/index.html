@@ -13,9 +13,11 @@
     .badge.live { background: #238636; color: #fff; }
     .badge.halted { background: #da3633; color: #fff; }
     .badge.connecting { background: #9e6a03; color: #fff; }
+    .badge.dryrun { background: #1f6feb; color: #fff; }
     main { padding: 24px; display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
     .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
-    .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: #8b949e; margin-bottom: 12px; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+    .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: #8b949e; margin-bottom: 12px; border-bottom: 1px solid #30363d; padding-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+    .card h2 .count { color: #58a6ff; font-size: 12px; }
     .metric { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #21262d; }
     .metric:last-child { border-bottom: none; }
     .metric .label { color: #8b949e; }
@@ -23,8 +25,8 @@
     .metric .value.positive { color: #3fb950; }
     .metric .value.negative { color: #f85149; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th { text-align: left; padding: 8px 6px; color: #8b949e; font-weight: normal; border-bottom: 1px solid #30363d; }
-    td { padding: 8px 6px; border-bottom: 1px solid #21262d; }
+    th { text-align: left; padding: 8px 6px; color: #8b949e; font-weight: normal; border-bottom: 1px solid #30363d; white-space: nowrap; }
+    td { padding: 8px 6px; border-bottom: 1px solid #21262d; vertical-align: middle; }
     tr:last-child td { border-bottom: none; }
     .no-data { color: #8b949e; font-style: italic; text-align: center; padding: 20px; }
     .controls { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -34,11 +36,17 @@
     button.danger:hover { background: #da363333; }
     button.success { border-color: #238636; color: #3fb950; }
     button.success:hover { background: #23863633; }
-    .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-    .status-dot.green { background: #3fb950; }
-    .status-dot.red { background: #f85149; }
-    .status-dot.yellow { background: #d29922; animation: pulse 1.5s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .tag { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 11px; background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb66; margin: 1px; }
+    .price-bar { display: flex; align-items: center; gap: 6px; }
+    .price-mid { font-weight: bold; font-size: 15px; color: #e6edf3; min-width: 44px; }
+    .price-mid.high { color: #3fb950; }
+    .price-mid.low { color: #f85149; }
+    .spread { font-size: 11px; color: #8b949e; }
+    .bid-ask { font-size: 11px; color: #8b949e; }
+    .question-cell { max-width: 320px; }
+    .question-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; display: block; }
+    .search-bar { width: 100%; padding: 6px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 13px; margin-bottom: 12px; }
+    .search-bar:focus { outline: none; border-color: #58a6ff; }
     footer { text-align: center; color: #8b949e; font-size: 12px; padding: 16px; border-top: 1px solid #30363d; }
   </style>
 </head>
@@ -46,6 +54,7 @@
   <header>
     <h1>PolySnipe</h1>
     <span id="conn-badge" class="badge connecting">Connecting...</span>
+    <span id="dry-badge" style="display:none" class="badge dryrun">DRY RUN</span>
     <span id="halt-badge" style="display:none" class="badge halted">TRADING HALTED</span>
     <span style="margin-left:auto; color:#8b949e; font-size:12px" id="last-update">--</span>
   </header>
@@ -56,8 +65,10 @@
       <h2>Bot Health</h2>
       <div class="metric"><span class="label">Uptime</span><span class="value" id="uptime">--</span></div>
       <div class="metric"><span class="label">Goroutines</span><span class="value" id="goroutines">--</span></div>
+      <div class="metric"><span class="label">Balance</span><span class="value positive" id="balance">--</span></div>
       <div class="metric"><span class="label">Session P&amp;L</span><span class="value" id="session-pnl">--</span></div>
       <div class="metric"><span class="label">Total Exposure</span><span class="value" id="exposure">--</span></div>
+      <div class="metric"><span class="label">Fills</span><span class="value" id="fill-count">--</span></div>
       <div class="metric"><span class="label">Last Error</span><span class="value" id="last-error" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">--</span></div>
     </div>
 
@@ -71,11 +82,31 @@
       <p style="color:#8b949e;font-size:12px;margin-top:12px">Strategy controls: <code>POST /api/strategy/pause?id=NAME</code></p>
     </div>
 
-    <!-- Positions -->
+    <!-- Open Positions -->
     <div class="card" style="grid-column: 1 / -1">
       <h2>Open Positions</h2>
       <div id="positions-container">
         <p class="no-data">No open positions.</p>
+      </div>
+    </div>
+
+    <!-- Active Markets -->
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>
+        Active Markets
+        <span class="count" id="market-count">0 markets</span>
+      </h2>
+      <input class="search-bar" id="market-search" type="text" placeholder="Filter markets..." oninput="renderMarkets()">
+      <div id="markets-container">
+        <p class="no-data">No markets discovered yet.</p>
+      </div>
+    </div>
+
+    <!-- Recent Fills -->
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>Recent Fills <span class="count" id="fills-count-label"></span></h2>
+      <div id="fills-container">
+        <p class="no-data">No fills yet.</p>
       </div>
     </div>
   </main>
@@ -85,6 +116,7 @@
   <script>
     let ws;
     let reconnectTimer;
+    let lastData = {};
 
     function connect() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -105,7 +137,7 @@
       ws.onerror = () => ws.close();
 
       ws.onmessage = (e) => {
-        try { updateUI(JSON.parse(e.data)); } catch {}
+        try { lastData = JSON.parse(e.data); updateUI(lastData); } catch {}
       };
     }
 
@@ -113,36 +145,116 @@
       document.getElementById('last-update').textContent = 'Updated: ' + new Date().toLocaleTimeString();
       document.getElementById('uptime').textContent = formatDuration(data.uptime_seconds || 0);
       document.getElementById('goroutines').textContent = data.goroutines ?? '--';
-      document.getElementById('exposure').textContent = data.total_exposure ?? '--';
+      document.getElementById('exposure').textContent = '$' + (parseFloat(data.total_exposure) || 0).toFixed(2);
+      document.getElementById('fill-count').textContent = data.fill_count ?? 0;
+
+      const bal = parseFloat(data.balance) || 0;
+      document.getElementById('balance').textContent = '$' + bal.toFixed(2);
 
       const pnl = parseFloat(data.session_pnl) || 0;
       const pnlEl = document.getElementById('session-pnl');
-      pnlEl.textContent = pnl.toFixed(4);
+      pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
       pnlEl.className = 'value ' + (pnl >= 0 ? 'positive' : 'negative');
 
-      const errEl = document.getElementById('last-error');
-      errEl.textContent = data.last_error || 'none';
-
-      const haltBadge = document.getElementById('halt-badge');
-      haltBadge.style.display = data.halted ? '' : 'none';
+      document.getElementById('last-error').textContent = data.last_error || 'none';
+      document.getElementById('halt-badge').style.display = data.halted ? '' : 'none';
+      document.getElementById('dry-badge').style.display = data.dry_run ? '' : 'none';
 
       renderPositions(data.positions || []);
+      renderMarkets(data.active_markets || []);
+      renderFills(data.fills || []);
     }
 
     function renderPositions(positions) {
       const el = document.getElementById('positions-container');
-      if (!positions.length) {
-        el.innerHTML = '<p class="no-data">No open positions.</p>';
-        return;
-      }
-      let html = '<table><thead><tr><th>Strategy</th><th>Market</th><th>Side</th><th>Entry Price</th><th>Size</th></tr></thead><tbody>';
+      if (!positions.length) { el.innerHTML = '<p class="no-data">No open positions.</p>'; return; }
+      let html = '<table><thead><tr><th>Strategy</th><th>Market</th><th>Side</th><th>Entry</th><th>Size</th></tr></thead><tbody>';
       for (const p of positions) {
         html += `<tr>
           <td>${p.strategy_id}</td>
-          <td>${p.market_id}</td>
+          <td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.market_id}</td>
           <td>${p.side}</td>
           <td>${p.entry_price}</td>
           <td>${p.size}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }
+
+    function renderMarkets() {
+      const markets = lastData.active_markets || [];
+      const filter = document.getElementById('market-search').value.toLowerCase();
+      const filtered = filter ? markets.filter(m => m.question.toLowerCase().includes(filter) || (m.tags||[]).some(t => t.includes(filter))) : markets;
+
+      document.getElementById('market-count').textContent = markets.length + ' market' + (markets.length !== 1 ? 's' : '');
+
+      const el = document.getElementById('markets-container');
+      if (!filtered.length) {
+        el.innerHTML = '<p class="no-data">' + (filter ? 'No markets match filter.' : 'No markets discovered yet.') + '</p>';
+        return;
+      }
+
+      let html = `<table>
+        <thead><tr>
+          <th>Question</th>
+          <th>Tags</th>
+          <th style="text-align:center">Mid Price</th>
+          <th style="text-align:center">Bid</th>
+          <th style="text-align:center">Ask</th>
+          <th>Strategies</th>
+          <th>Age</th>
+        </tr></thead><tbody>`;
+
+      for (const m of filtered) {
+        const bid = m.best_bid || 0;
+        const ask = m.best_ask || 0;
+        const mid = bid && ask ? ((bid + ask) / 2) : (m.last_price || 0);
+        const midPct = (mid * 100).toFixed(1);
+        const midClass = mid >= 0.8 ? 'high' : mid <= 0.2 ? 'low' : '';
+        const tags = (m.tags || []).map(t => `<span class="tag">${t}</span>`).join('');
+        const strats = (m.strategies || []).join(', ');
+        const age = formatDuration(m.age_seconds || 0);
+
+        html += `<tr>
+          <td class="question-cell"><span class="question-text" title="${m.question}">${m.question}</span></td>
+          <td>${tags}</td>
+          <td style="text-align:center"><span class="price-mid ${midClass}">${mid ? midPct + '¢' : '--'}</span></td>
+          <td style="text-align:center;color:#3fb950">${bid ? (bid*100).toFixed(1) + '¢' : '--'}</td>
+          <td style="text-align:center;color:#f85149">${ask ? (ask*100).toFixed(1) + '¢' : '--'}</td>
+          <td style="color:#8b949e;font-size:12px">${strats}</td>
+          <td style="color:#8b949e;font-size:12px;white-space:nowrap">${age}</td>
+        </tr>`;
+      }
+
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }
+
+    function renderFills(fills) {
+      document.getElementById('fills-count-label').textContent = fills.length ? `(${fills.length})` : '';
+      const el = document.getElementById('fills-container');
+      if (!fills.length) { el.innerHTML = '<p class="no-data">No fills yet.</p>'; return; }
+      const recent = [...fills].reverse().slice(0, 50);
+      let html = `<table><thead><tr>
+        <th>Time</th><th>Strategy</th><th>Question</th><th>Side</th>
+        <th style="text-align:right">Price</th><th style="text-align:right">Size</th>
+        <th style="text-align:right">P&L</th>
+      </tr></thead><tbody>`;
+      for (const f of recent) {
+        const pnl = parseFloat(f.pnl) || 0;
+        const pnlStr = pnl === 0 ? '--' : (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+        const pnlClass = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : '';
+        const t = new Date(f.timestamp);
+        const timeStr = t.toLocaleTimeString();
+        html += `<tr>
+          <td style="color:#8b949e;font-size:12px;white-space:nowrap">${timeStr}</td>
+          <td>${f.strategy_id}</td>
+          <td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.market_id}">${f.question || f.market_id}</td>
+          <td>${f.side}</td>
+          <td style="text-align:right">${(parseFloat(f.price)*100).toFixed(1)}¢</td>
+          <td style="text-align:right">$${parseFloat(f.size).toFixed(2)}</td>
+          <td style="text-align:right" class="${pnlClass}">${pnlStr}</td>
         </tr>`;
       }
       html += '</tbody></table>';

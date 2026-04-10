@@ -20,6 +20,8 @@ import (
 type StateProvider interface {
 	Positions() []executor.Position
 	SessionPnL() float64
+	Balance() float64
+	RecentFills() []executor.Fill
 	IsHalted() bool
 	ResumeTrading()
 	PauseStrategy(id string)
@@ -27,6 +29,20 @@ type StateProvider interface {
 	Uptime() time.Duration
 	GoroutineCount() int
 	LastError() string
+	ActiveMarkets() []MarketStackInfo
+	IsDryRun() bool
+}
+
+// MarketStackInfo describes a live market stack for the dashboard.
+type MarketStackInfo struct {
+	MarketID     string
+	Question     string
+	Tags         []string
+	Strategies   []string
+	SubscribedAt time.Time
+	LastPrice    float64
+	BestBid      float64
+	BestAsk      float64
 }
 
 // Server is the dashboard HTTP + WebSocket server.
@@ -68,6 +84,7 @@ func NewServer(cfg config.DashboardConfig, riskMgr *risk.Manager, state StatePro
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/positions", s.handlePositions)
+	mux.HandleFunc("/api/markets", s.handleMarkets)
 	mux.HandleFunc("/api/halt", s.handleHalt)
 	mux.HandleFunc("/api/resume", s.handleResume)
 	mux.HandleFunc("/api/strategy/pause", s.handlePauseStrategy)
@@ -168,14 +185,56 @@ func (s *Server) buildStatus() map[string]interface{} {
 		})
 	}
 
+	activeMarkets := s.state.ActiveMarkets()
+	mktData := make([]map[string]interface{}, 0, len(activeMarkets))
+	for _, m := range activeMarkets {
+		mktData = append(mktData, map[string]interface{}{
+			"market_id":     m.MarketID,
+			"question":      m.Question,
+			"tags":          m.Tags,
+			"strategies":    m.Strategies,
+			"subscribed_at": m.SubscribedAt.UTC(),
+			"age_seconds":   time.Since(m.SubscribedAt).Seconds(),
+			"last_price":    m.LastPrice,
+			"best_bid":      m.BestBid,
+			"best_ask":      m.BestAsk,
+		})
+	}
+
+	fills := s.state.RecentFills()
+	fillData := make([]map[string]interface{}, 0, len(fills))
+	for _, f := range fills {
+		question := f.Question
+		if question == "" {
+			question = f.MarketID
+		}
+		fillData = append(fillData, map[string]interface{}{
+			"strategy_id": f.StrategyID,
+			"market_id":   f.MarketID,
+			"question":    question,
+			"side":        f.Side.String(),
+			"price":       f.Price.String(),
+			"size":        f.Size.String(),
+			"fee":         f.Fee.String(),
+			"pnl":         f.PnL.String(),
+			"timestamp":   f.Timestamp.UTC(),
+		})
+	}
+
 	return map[string]interface{}{
-		"timestamp":       time.Now().UTC(),
-		"halted":          s.state.IsHalted(),
-		"uptime_seconds":  s.state.Uptime().Seconds(),
-		"goroutines":      s.state.GoroutineCount(),
-		"session_pnl":     s.state.SessionPnL(),
-		"total_exposure":  s.risk.TotalExposure().String(),
-		"positions":       posData,
-		"last_error":      s.state.LastError(),
+		"timestamp":      time.Now().UTC(),
+		"halted":         s.state.IsHalted(),
+		"dry_run":        s.state.IsDryRun(),
+		"uptime_seconds": s.state.Uptime().Seconds(),
+		"goroutines":     s.state.GoroutineCount(),
+		"balance":        s.state.Balance(),
+		"session_pnl":    s.state.SessionPnL(),
+		"total_exposure": s.risk.TotalExposure().String(),
+		"positions":      posData,
+		"last_error":     s.state.LastError(),
+		"active_markets": mktData,
+		"market_count":   len(activeMarkets),
+		"fills":          fillData,
+		"fill_count":     len(fills),
 	}
 }

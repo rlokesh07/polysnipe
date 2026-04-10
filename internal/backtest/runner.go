@@ -84,24 +84,14 @@ func (r *Runner) Run(ctx context.Context, strategies []strategy.Strategy) error 
 		r.log,
 	)
 
-	// Collect market IDs needed by the strategies.
+	// Collect tag-based market IDs for backtest (tags are used as synthetic market IDs).
 	marketIDs := r.collectMarketIDs(strategies)
 
-	// Fetch or generate historical data for each market.
+	// Generate synthetic historical data for each tag-market.
 	marketEvents := make(map[string][]feed.MarketEvent)
 	for _, mktID := range marketIDs {
-		mktCfg := r.cfg.MarketByID(mktID)
-		var events []feed.MarketEvent
-		if mktCfg != nil && mktCfg.TokenIDYes != "" {
-			events, err = r.fetcher.Fetch(mktID, mktCfg.TokenIDYes, start, end)
-			if err != nil {
-				r.log.Warn().Err(err).Str("market", mktID).Msg("fetch failed; using synthetic data")
-				events = GenerateSampleEvents(mktID, start, end)
-			}
-		} else {
-			r.log.Info().Str("market", mktID).Msg("no token ID configured; using synthetic data")
-			events = GenerateSampleEvents(mktID, start, end)
-		}
+		r.log.Info().Str("market", mktID).Msg("using synthetic data for backtest")
+		events := GenerateSampleEvents(mktID, start, end)
 		marketEvents[mktID] = events
 		r.log.Info().Str("market", mktID).Int("events", len(events)).Msg("data ready")
 	}
@@ -132,8 +122,9 @@ func (r *Runner) Run(ctx context.Context, strategies []strategy.Strategy) error 
 		snapshotChs[mktID] = make(map[string]chan state.MarketSnapshot)
 
 		for _, strat := range strategies {
-			for _, m := range strat.Markets() {
-				if m == mktID {
+			// A strategy participates in a tag-market if the market ID matches any of its tags.
+			for _, tag := range strat.Tags() {
+				if tag == mktID {
 					ch := make(chan state.MarketSnapshot, 1)
 					eng.Subscribe(ch)
 					snapshotChs[mktID][strat.ID()] = ch
@@ -160,8 +151,8 @@ func (r *Runner) Run(ctx context.Context, strategies []strategy.Strategy) error 
 		strat := strat
 		fbCh := feedbackChs[strat.ID()]
 		// Merge all market snapshots for this strategy into one channel.
-		mergedCh := make(chan state.MarketSnapshot, len(strat.Markets())+1)
-		for _, mktID := range strat.Markets() {
+		mergedCh := make(chan state.MarketSnapshot, len(strat.Tags())+1)
+		for _, mktID := range strat.Tags() {
 			if ch, ok := snapshotChs[mktID][strat.ID()]; ok {
 				src := ch
 				go func() {
@@ -257,15 +248,16 @@ func (r *Runner) Run(ctx context.Context, strategies []strategy.Strategy) error 
 	return r.reporter.Write(sim, balance, start, end)
 }
 
-// collectMarketIDs returns deduplicated market IDs needed by the given strategies.
+// collectMarketIDs returns deduplicated tag-based market IDs for backtesting.
+// Each unique tag across all strategies becomes a synthetic market.
 func (r *Runner) collectMarketIDs(strategies []strategy.Strategy) []string {
 	seen := make(map[string]bool)
 	var ids []string
 	for _, strat := range strategies {
-		for _, mktID := range strat.Markets() {
-			if !seen[mktID] {
-				seen[mktID] = true
-				ids = append(ids, mktID)
+		for _, tag := range strat.Tags() {
+			if !seen[tag] {
+				seen[tag] = true
+				ids = append(ids, tag)
 			}
 		}
 	}

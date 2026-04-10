@@ -15,18 +15,32 @@ connection:
   reconnect_backoff_max_ms: 30000
   request_timeout_ms: 5000
 
-# --- Markets ---
-markets:
-  - id: "btc-5min-up"
-    condition_id: "0x0000000000000000000000000000000000000000000000000000000000000001"
-    token_id_yes: "0x0000000000000000000000000000000000000000000000000000000000000002"
-    token_id_no: "0x0000000000000000000000000000000000000000000000000000000000000003"
-    label: "BTC 5-Min Up"
-  - id: "btc-5min-down"
-    condition_id: "0x0000000000000000000000000000000000000000000000000000000000000004"
-    token_id_yes: "0x0000000000000000000000000000000000000000000000000000000000000005"
-    token_id_no: "0x0000000000000000000000000000000000000000000000000000000000000006"
-    label: "BTC 5-Min Down"
+# --- Dry Run (paper trading) ---
+# When true, uses a simulated executor: real market data, no real orders.
+dry_run: true
+dry_run_balance: 1000.0
+
+# --- Market Discovery ---
+discovery:
+  enabled: true
+  poll_interval_seconds: 60
+  gamma_api_url: "https://gamma-api.polymarket.com"
+  rate_limit_per_second: 10
+
+  watchlists:
+    - name: "short-expiry-any"
+      tags: []
+      filters:
+        max_expiry_minutes: 10
+        min_volume_24h: 1000.0
+        active: true
+
+    - name: "live-games"
+      tags: []
+      filters:
+        title_contains: "In-Game Trading"
+        min_volume_24h: 500.0
+        active: true
 
 # --- Execution ---
 execution:
@@ -59,10 +73,11 @@ risk:
     default:
       max_exposure: 2000.0
       max_strategies_active: 4
-    overrides:                             # per-market overrides
-      btc-5min-up:
+    tag_overrides:                         # tag-based overrides (since market IDs are dynamic)
+      crypto:
         max_exposure: 3000.0
-        max_strategies_active: 4
+      nba:
+        max_exposure: 1000.0
   per_strategy:
     default:
       max_position_size: 500.0
@@ -75,45 +90,45 @@ risk:
 # --- Strategies ---
 strategies:
   spread_threshold:
-    enabled: true
-    markets: ["btc-5min-up", "btc-5min-down"]
+    enabled: false
+    tags: []
     params:
       spread_trigger_bps: 50
       spread_exit_bps: 20
       side: "cheap"
   momentum:
-    enabled: true
-    markets: ["btc-5min-up"]
+    enabled: false
+    tags: []
     params:
       consecutive_ticks: 5
       min_move_bps: 10
       hold_duration_seconds: 60
   time_decay:
     enabled: true
-    markets: ["btc-5min-up", "btc-5min-down"]
+    tags: []
     params:
-      trigger_remaining_seconds: 30
-      skew_threshold: 0.70
+      trigger_remaining_seconds: 0
+      skew_threshold: 0.80
   # --- Stub slots for user-implemented strategies ---
   mid_flip:
     enabled: false
-    markets: []
+    tags: []
     params: {}
   reversal_snipe:
     enabled: false
-    markets: []
+    tags: []
     params: {}
   last_second_collapse:
     enabled: false
-    markets: []
+    tags: []
     params: {}
   strategy_7:
     enabled: false
-    markets: []
+    tags: []
     params: {}
   strategy_8:
     enabled: false
-    markets: []
+    tags: []
     params: {}
 
 # --- Backtesting ---
@@ -142,7 +157,7 @@ logging:
 dashboard:
   enabled: true
   host: "0.0.0.0"
-  port: 8080
+  port: 8081
   auth_token: "${DASHBOARD_AUTH_TOKEN}"
   websocket_push_interval_ms: 500
   cors_allowed_origins: ["*"]
