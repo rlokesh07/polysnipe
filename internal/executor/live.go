@@ -126,21 +126,23 @@ func (e *LiveExecutor) Balance() decimal.Decimal {
 
 // fetchBalance retrieves the current USDC balance from the CLOB REST API.
 func (e *LiveExecutor) fetchBalance(ctx context.Context) (decimal.Decimal, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.connCfg.RESTBaseURL+"/balance", nil)
+	const balPath = "/balance-allowance"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		e.connCfg.RESTBaseURL+balPath+"?asset_type=COLLATERAL", nil)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	for k, v := range e.buildL2Headers("GET", "/balance", "") {
+	for k, v := range e.buildL2Headers("GET", balPath, "") {
 		req.Header.Set(k, v)
 	}
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return decimal.Zero, fmt.Errorf("GET /balance: %w", err)
+		return decimal.Zero, fmt.Errorf("GET /balance-allowance: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return decimal.Zero, fmt.Errorf("GET /balance status %d: %s", resp.StatusCode, body)
+		return decimal.Zero, fmt.Errorf("GET /balance-allowance status %d: %s", resp.StatusCode, body)
 	}
 	var result struct {
 		Balance string `json:"balance"`
@@ -158,9 +160,9 @@ type clobOpenOrder struct {
 
 // fetchOpenOrders returns all open orders for the current account.
 func (e *LiveExecutor) fetchOpenOrders(ctx context.Context) ([]clobOpenOrder, error) {
-	const path = "/orders"
+	const path = "/data/orders"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		e.connCfg.RESTBaseURL+path+"?status=OPEN", nil)
+		e.connCfg.RESTBaseURL+path+"?maker="+e.walletAddress+"&status=OPEN", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -169,12 +171,12 @@ func (e *LiveExecutor) fetchOpenOrders(ctx context.Context) ([]clobOpenOrder, er
 	}
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GET /orders: %w", err)
+		return nil, fmt.Errorf("GET /data/orders: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET /orders status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("GET /data/orders status %d: %s", resp.StatusCode, body)
 	}
 	var orders []clobOpenOrder
 	return orders, json.Unmarshal(body, &orders)

@@ -36,7 +36,7 @@ func newTestExecutor(t *testing.T, serverURL string) *LiveExecutor {
 
 func TestFetchBalance_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/balance" {
+		if r.Method != http.MethodGet || r.URL.Path != "/balance-allowance" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
 		json.NewEncoder(w).Encode(map[string]string{"balance": "250.75"})
@@ -138,7 +138,7 @@ func TestReconcileOpenOrders_CancelsOrphans(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/orders":
+		case r.Method == http.MethodGet && r.URL.Path == "/data/orders":
 			json.NewEncoder(w).Encode([]clobOpenOrder{{ID: "stale-1"}, {ID: "stale-2"}})
 		case r.Method == http.MethodDelete:
 			id := r.URL.Path[len("/order/"):]
@@ -227,7 +227,7 @@ func TestSubmitOrder_InsufficientBalance_RefreshesBalance(t *testing.T) {
 				"error":      "insufficient balance",
 				"error_code": "insufficient_balance",
 			})
-		case "/balance":
+		case "/balance-allowance":
 			balanceFetched = true
 			json.NewEncoder(w).Encode(map[string]string{"balance": "5.00"})
 		}
