@@ -273,17 +273,20 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		sizer = sizing.NewFixedSizer(cfg.Sizing)
 	}
 
-	// marketStates holds the latest bid/ask for each subscribed market.
-	// Updated by the priceCh goroutine in subscribeMarket; read by LiveExecutor for order pricing.
-	type bidAsk struct{ bid, ask decimal.Decimal }
+	// marketStates holds the latest bid/ask and YES token ID for each subscribed market.
+	// Keyed by conditionID; updated by subscribeMarket; read by LiveExecutor for order pricing and signing.
+	type marketStateEntry struct {
+		bid, ask   decimal.Decimal
+		tokenIDYes string // YES token uint256 ID (decimal string) — required for CTF Exchange orders
+	}
 	var marketStates sync.Map
 
-	getMarketState := func(marketID string) (decimal.Decimal, decimal.Decimal, bool) {
+	getMarketState := func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool) {
 		if v, ok := marketStates.Load(marketID); ok {
-			s := v.(bidAsk)
-			return s.bid, s.ask, s.bid.IsPositive() && s.ask.IsPositive()
+			s := v.(marketStateEntry)
+			return s.bid, s.ask, s.tokenIDYes, s.bid.IsPositive() && s.ask.IsPositive()
 		}
-		return decimal.Zero, decimal.Zero, false
+		return decimal.Zero, decimal.Zero, "", false
 	}
 
 	var liveExec executor.Executor
@@ -399,7 +402,11 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 			for snap := range priceCh {
 				stack.setPrice(snap)
 				if snap.BestBid.IsPositive() && snap.BestAsk.IsPositive() {
-					marketStates.Store(mktID, bidAsk{snap.BestBid, snap.BestAsk})
+					marketStates.Store(mktID, marketStateEntry{
+						bid:        snap.BestBid,
+						ask:        snap.BestAsk,
+						tokenIDYes: cmd.Market.TokenIDYes,
+					})
 				}
 				if maxSpreadCents > 0 && !spreadChecked && snap.BestBid.IsPositive() && snap.BestAsk.IsPositive() {
 					spreadChecked = true

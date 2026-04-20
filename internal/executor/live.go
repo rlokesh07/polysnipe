@@ -41,7 +41,7 @@ type LiveExecutor struct {
 	httpClient     *http.Client
 	privateKey     *ecdsa.PrivateKey // wallet private key for EIP-712 order signing
 	walletAddress  string            // derived from privateKey; used as POLY_ADDRESS and order maker
-	getMarketState func(marketID string) (bid, ask decimal.Decimal, ok bool)
+	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool)
 
 	mu          sync.Mutex
 	balance     decimal.Decimal
@@ -55,7 +55,7 @@ func NewLiveExecutor(
 	riskMgr *risk.Manager,
 	sizer sizing.Sizer,
 	balance decimal.Decimal,
-	getMarketState func(marketID string) (bid, ask decimal.Decimal, ok bool),
+	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool),
 	log zerolog.Logger,
 ) (*LiveExecutor, error) {
 	var privKey *ecdsa.PrivateKey
@@ -98,7 +98,7 @@ func NewLiveExecutor(
 // Falls back to sig.Price, then 0.5 with a warning.
 func (e *LiveExecutor) resolveOrderPrice(marketID string, sigPrice decimal.Decimal) (decimal.Decimal, error) {
 	if e.getMarketState != nil {
-		bid, ask, ok := e.getMarketState(marketID)
+		bid, ask, _, ok := e.getMarketState(marketID)
 		if ok && bid.IsPositive() && ask.IsPositive() {
 			if e.cfg.MaxOrderSpreadCents > 0 {
 				spread, _ := ask.Sub(bid).Mul(decimal.NewFromInt(100)).Float64()
@@ -143,7 +143,7 @@ func (e *LiveExecutor) fetchBalance(ctx context.Context) (decimal.Decimal, error
 		return decimal.Zero, fmt.Errorf("GET /balance status %d: %s", resp.StatusCode, body)
 	}
 	var result struct {
-		Balance string `json:"balance"` // ⚠️ verify field name against CLOB docs
+		Balance string `json:"balance"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return decimal.Zero, fmt.Errorf("parse balance: %w", err)
@@ -153,14 +153,14 @@ func (e *LiveExecutor) fetchBalance(ctx context.Context) (decimal.Decimal, error
 
 // clobOpenOrder represents an open order from the CLOB.
 type clobOpenOrder struct {
-	ID string `json:"id"` // ⚠️ verify field name against CLOB docs
+	ID string `json:"id"`
 }
 
 // fetchOpenOrders returns all open orders for the current account.
 func (e *LiveExecutor) fetchOpenOrders(ctx context.Context) ([]clobOpenOrder, error) {
 	const path = "/orders"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		e.connCfg.RESTBaseURL+path+"?status=OPEN", nil) // ⚠️ verify endpoint against CLOB docs
+		e.connCfg.RESTBaseURL+path+"?status=OPEN", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -626,13 +626,24 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	makerAmount := makerAmt.BigInt()
 	takerAmount := takerAmt.BigInt()
 
-	// Parse tokenId: decimal string preferred; hex string (0x...) also accepted.
+	// Resolve YES token ID from the market state store (set by discovery engine).
+	// Both BUY and SELL orders use the YES token ID; direction is indicated by the side field.
 	tokenID := new(big.Int)
-	tidStr := strings.TrimPrefix(marketID, "0x")
-	if len(tidStr) < len(marketID) { // had 0x prefix → hex
-		tokenID.SetString(tidStr, 16)
-	} else {
-		tokenID.SetString(marketID, 10)
+	if e.getMarketState != nil {
+		_, _, tokenIDYes, ok := e.getMarketState(marketID)
+		if ok && tokenIDYes != "" {
+			tokenID.SetString(tokenIDYes, 10)
+		}
+	}
+	if tokenID.Sign() == 0 {
+		// Fallback: try parsing marketID directly (hex or decimal).
+		tidStr := strings.TrimPrefix(marketID, "0x")
+		if len(tidStr) < len(marketID) {
+			tokenID.SetString(tidStr, 16)
+		} else {
+			tokenID.SetString(marketID, 10)
+		}
+		e.log.Warn().Str("market", marketID).Msg("YES token ID not in market state; falling back to marketID as tokenId — order may be rejected")
 	}
 
 	// Random salt makes each order unique (required by CTF Exchange).
