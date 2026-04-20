@@ -2,6 +2,14 @@ import json
 import os
 import sys
 
+# Patch requests to log URLs before importing py_clob_client
+import requests
+original_request = requests.Session.request
+def patched_request(self, method, url, **kwargs):
+    print(f"  [HTTP] {method} {url}", file=sys.stderr)
+    return original_request(self, method, url, **kwargs)
+requests.Session.request = patched_request
+
 try:
     from py_clob_client.client import ClobClient, ApiCreds
     from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
@@ -23,18 +31,13 @@ client = ClobClient(
         api_secret=os.environ["POLYMARKET_API_SECRET"],
         api_passphrase=os.environ["POLYMARKET_PASSPHRASE"],
     ),
-    signature_type=0,  # EOA wallet
+    signature_type=0,
 )
 
-print("=== /balance ===")
-print(json.dumps(client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)), indent=2))
+print("=== balance ===")
+result = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+print(json.dumps(result, indent=2))
 
-print("\n=== /orders (open) ===")
-print(json.dumps(client.get_orders(), indent=2))
-
-print("\n=== sample markets ===")
-markets = client.get_markets()
-data = markets.get("data") or markets if isinstance(markets, list) else []
-for m in data[:3]:
-    print(json.dumps(m, indent=2))
-    print("---")
+print("\n=== open orders ===")
+result = client.get_orders()
+print(json.dumps(result, indent=2))
