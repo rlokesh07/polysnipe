@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PolySnipe Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9; font-size: 14px; }
@@ -102,6 +103,12 @@
       </div>
     </div>
 
+    <!-- Price Charts -->
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>Price Charts <span class="count" id="charts-count"></span></h2>
+      <div id="charts-container" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;"></div>
+    </div>
+
     <!-- Recent Fills -->
     <div class="card" style="grid-column: 1 / -1">
       <h2>Recent Fills <span class="count" id="fills-count-label"></span></h2>
@@ -162,19 +169,25 @@
 
       renderPositions(data.positions || []);
       renderMarkets(data.active_markets || []);
+      renderCharts(data.active_markets || []);
       renderFills(data.fills || []);
     }
 
     function renderPositions(positions) {
       const el = document.getElementById('positions-container');
       if (!positions.length) { el.innerHTML = '<p class="no-data">No open positions.</p>'; return; }
-      let html = '<table><thead><tr><th>Strategy</th><th>Market</th><th>Side</th><th>Entry</th><th>Size</th></tr></thead><tbody>';
+      positions = [...positions].sort((a, b) => (a.question || '').localeCompare(b.question || ''));
+      let html = '<table><thead><tr><th>Strategy</th><th>Market</th><th>Side</th><th>Entry</th><th>Current</th><th>Size</th></tr></thead><tbody>';
       for (const p of positions) {
+        const entry = parseFloat(p.entry_price) || 0;
+        const current = parseFloat(p.current_price) || 0;
+        const pnlDir = current >= entry ? 'positive' : 'negative';
         html += `<tr>
           <td>${p.strategy_id}</td>
-          <td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.market_id}</td>
+          <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.market_id}">${p.question}</td>
           <td>${p.side}</td>
-          <td>${p.entry_price}</td>
+          <td>${entry.toFixed(4)}</td>
+          <td class="${pnlDir}">${current.toFixed(4)}</td>
           <td>${p.size}</td>
         </tr>`;
       }
@@ -188,6 +201,8 @@
       const filtered = filter ? markets.filter(m => m.question.toLowerCase().includes(filter) || (m.tags||[]).some(t => t.includes(filter))) : markets;
 
       document.getElementById('market-count').textContent = markets.length + ' market' + (markets.length !== 1 ? 's' : '');
+
+      filtered.sort((a, b) => a.question.localeCompare(b.question));
 
       const el = document.getElementById('markets-container');
       if (!filtered.length) {
@@ -259,6 +274,170 @@
       }
       html += '</tbody></table>';
       el.innerHTML = html;
+    }
+
+    const chartInstances = {}; // market_id -> Chart instance
+
+    function computeSMA(prices, period) {
+      return prices.map((_, i) => {
+        if (i < period - 1) return null;
+        const slice = prices.slice(i - period + 1, i + 1);
+        return slice.reduce((a, b) => a + b, 0) / period;
+      });
+    }
+
+    function renderCharts(markets) {
+      const SMA_PERIOD = 20;
+      const container = document.getElementById('charts-container');
+      const currentIDs = new Set(markets.map(m => m.market_id));
+
+      // Remove charts for markets that are gone.
+      for (const id of Object.keys(chartInstances)) {
+        if (!currentIDs.has(id)) {
+          chartInstances[id].destroy();
+          delete chartInstances[id];
+          const el = document.getElementById('chartbox-' + id);
+          if (el) el.remove();
+        }
+      }
+
+      document.getElementById('charts-count').textContent =
+        markets.length + ' market' + (markets.length !== 1 ? 's' : '');
+
+      for (const m of markets) {
+        const history = m.price_history || [];
+        if (history.length < 2) continue;
+
+        const sma = computeSMA(history, SMA_PERIOD);
+        const labels = history.map((_, i) => i);
+
+        if (chartInstances[m.market_id]) {
+          // Update existing chart.
+          const chart = chartInstances[m.market_id];
+          chart.data.labels = labels;
+          chart.data.datasets[0].data = history;
+          chart.data.datasets[1].data = sma;
+          chart.update('none'); // no animation on update
+        } else {
+          // Create new chart box.
+          const box = document.createElement('div');
+          box.id = 'chartbox-' + m.market_id;
+          box.style.cssText = 'background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;';
+
+          const title = document.createElement('div');
+          title.style.cssText = 'font-size:11px;color:#8b949e;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+          title.title = m.market_id;
+          title.textContent = m.question;
+
+          const canvas = document.createElement('canvas');
+          canvas.height = 110;
+
+          box.appendChild(title);
+          box.appendChild(canvas);
+          container.appendChild(box);
+
+          // Build signal scatter points from fills for this market.
+          // Fills are recent so we plot them at the tail of the history.
+          const marketFills = (lastData.fills || []).filter(f => f.market_id === m.market_id);
+          const buyYesPts = [], buyNoPts = [], closePts = [];
+          for (const f of marketFills) {
+            const yesPrice = f.side === 'BuyNo' ? 1 - parseFloat(f.price) : parseFloat(f.price);
+            const x = history.length - 1; // place at tail
+            if (f.side === 'BuyYes') buyYesPts.push({x, y: yesPrice});
+            else if (f.side === 'BuyNo') buyNoPts.push({x, y: yesPrice});
+            else closePts.push({x, y: yesPrice});
+          }
+
+          const chart = new Chart(canvas, {
+            type: 'line',
+            data: {
+              labels,
+              datasets: [
+                {
+                  label: 'Price',
+                  data: history,
+                  borderColor: '#58a6ff',
+                  borderWidth: 1.5,
+                  pointRadius: 0,
+                  tension: 0.2,
+                },
+                {
+                  label: 'SMA(' + SMA_PERIOD + ')',
+                  data: sma,
+                  borderColor: '#f0883e',
+                  borderWidth: 1.5,
+                  borderDash: [4, 3],
+                  pointRadius: 0,
+                  tension: 0.2,
+                  spanGaps: false,
+                },
+                {
+                  label: 'Buy YES',
+                  data: buyYesPts,
+                  type: 'scatter',
+                  pointStyle: 'triangle',
+                  pointRadius: 8,
+                  backgroundColor: '#3fb950',
+                  borderColor: '#3fb950',
+                },
+                {
+                  label: 'Buy NO',
+                  data: buyNoPts,
+                  type: 'scatter',
+                  pointStyle: 'triangle',
+                  rotation: 180,
+                  pointRadius: 8,
+                  backgroundColor: '#f85149',
+                  borderColor: '#f85149',
+                },
+                {
+                  label: 'Close',
+                  data: closePts,
+                  type: 'scatter',
+                  pointStyle: 'crossRot',
+                  pointRadius: 7,
+                  backgroundColor: '#e6edf3',
+                  borderColor: '#e6edf3',
+                  borderWidth: 2,
+                },
+              ],
+            },
+            options: {
+              animation: false,
+              responsive: true,
+              maintainAspectRatio: true,
+              plugins: {
+                legend: { display: false },
+                tooltip: {
+                  mode: 'index', intersect: false,
+                  callbacks: {
+                    label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y !== null ? (ctx.parsed.y * 100).toFixed(1) + '¢' : ''),
+                  }
+                },
+              },
+              scales: {
+                x: { display: false },
+                y: {
+                  min: 0, max: 1,
+                  ticks: {
+                    color: '#8b949e',
+                    font: { size: 10 },
+                    callback: v => (v * 100).toFixed(0) + '¢',
+                    maxTicksLimit: 5,
+                  },
+                  grid: { color: '#21262d' },
+                  border: { color: '#30363d' },
+                },
+              },
+            },
+          });
+          chartInstances[m.market_id] = chart;
+        }
+      }
+
+      if (container.children.length === 0) {
+        container.innerHTML = '<p class="no-data">No price data yet.</p>';
+      }
     }
 
     function formatDuration(seconds) {

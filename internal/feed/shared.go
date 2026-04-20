@@ -126,11 +126,35 @@ func (sf *SharedFeed) connect(ctx context.Context) error {
 	writeCh := make(chan interface{}, 32)
 	writeErr := make(chan error, 1)
 
+	// Reset read deadline whenever a pong is received.
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
 	go func() {
 		for msg := range writeCh {
 			if err := conn.WriteJSON(msg); err != nil {
 				writeErr <- err
 				return
+			}
+		}
+	}()
+
+	// Keepalive: send a ping every 30 seconds so the server doesn't drop us.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					writeErr <- fmt.Errorf("ping: %w", err)
+					return
+				}
 			}
 		}
 	}()
@@ -206,12 +230,22 @@ func (sf *SharedFeed) connect(ctx context.Context) error {
 		sf.mu.RLock()
 		for _, ev := range events {
 			// Route by asset_id (stored in ev.MarketID temporarily as token).
-			if s, ok := sf.byToken[ev.MarketID]; ok {
-				ev.MarketID = s.marketID
-				select {
-				case s.outCh <- ev:
-				default:
-				}
+			tokenID := ev.MarketID
+			s, ok := sf.byToken[tokenID]
+			if !ok {
+				continue
+			}
+			// Only forward YES token events. NO token prices mirror YES prices
+			// (NO_bid ≈ 1 - YES_ask) so they carry no additional information,
+			// and mixing them causes the state engine to alternate between
+			// YES and NO prices producing a zigzag artefact.
+			if tokenID == s.tokenIDNo {
+				continue
+			}
+			ev.MarketID = s.marketID
+			select {
+			case s.outCh <- ev:
+			default:
 			}
 		}
 		sf.mu.RUnlock()

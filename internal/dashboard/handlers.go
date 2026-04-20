@@ -97,6 +97,11 @@ func (s *Server) handleResumeStrategy(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "resumed", "id": id})
 }
 
+const (
+	wsPingInterval = 30 * time.Second
+	wsPongTimeout  = 60 * time.Second
+)
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -110,13 +115,37 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	s.log.Debug().Str("remote", r.RemoteAddr).Msg("dashboard client connected")
 
+	// Reset read deadline each time a pong arrives.
+	conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
+		return nil
+	})
+
 	// Send initial state.
 	data, _ := json.Marshal(s.buildStatus())
 	conn.WriteMessage(websocket.TextMessage, data)
 
+	// Ping ticker to keep the connection alive.
+	ticker := time.NewTicker(wsPingInterval)
+	defer ticker.Stop()
+	go func() {
+		for range ticker.C {
+			s.mu.Lock()
+			_, alive := s.clients[conn]
+			s.mu.Unlock()
+			if !alive {
+				return
+			}
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}()
+
 	// Read loop — handle client disconnection.
 	for {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			break

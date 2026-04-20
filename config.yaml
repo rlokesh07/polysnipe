@@ -7,9 +7,10 @@
 connection:
   websocket_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
   rest_base_url: "https://clob.polymarket.com"
-  api_key: "${POLYMARKET_API_KEY}"         # env var substitution
-  api_secret: "${POLYMARKET_API_SECRET}"
-  passphrase: "${POLYMARKET_PASSPHRASE}"
+  wallet_private_key: "${POLYMARKET_WALLET_KEY}"  # hex private key — signs orders + derives POLY_ADDRESS
+  api_key: "${POLYMARKET_API_KEY}"                # derived via py-clob-client — POLY_API_KEY L2 header
+  api_secret: "${POLYMARKET_API_SECRET}"          # derived base64url secret — HMAC L2 signing key
+  passphrase: "${POLYMARKET_PASSPHRASE}"          # derived passphrase — POLY_PASSPHRASE L2 header
   reconnect_max_retries: 10
   reconnect_backoff_base_ms: 500
   reconnect_backoff_max_ms: 30000
@@ -18,7 +19,7 @@ connection:
 # --- Dry Run (paper trading) ---
 # When true, uses a simulated executor: real market data, no real orders.
 dry_run: true
-dry_run_balance: 1000.0
+dry_run_balance: 20.0
 
 # --- Market Discovery ---
 discovery:
@@ -26,6 +27,14 @@ discovery:
   poll_interval_seconds: 60
   gamma_api_url: "https://gamma-api.polymarket.com"
   rate_limit_per_second: 10
+  max_markets: 20                             # cap on simultaneous WebSocket subscriptions (0 = unlimited)
+  max_spread_cents: 5                         # drop market if bid-ask spread > N cents on first tick (0 = disabled)
+  updown_max_spread_cents: 5                 # spread threshold override for up-or-down markets (0 = use max_spread_cents)
+  stale_market_timeout_sec: 15               # drop market if no price tick received within this window (0 = disabled)
+  updown_stale_timeout_sec: 60              # stale timeout for up-or-down markets (longer grace period; 0 = use default)
+  updown_markets:
+    enabled: true
+    assets: ["btc", "eth", "sol", "xrp"]    # generates 15m and 1h slug candidates each poll cycle
 
   watchlists:
     - name: "short-expiry-any"
@@ -52,6 +61,8 @@ execution:
   retry_max_attempts: 3
   retry_backoff_ms: 200
   cooldown_between_orders_ms: 100
+  max_order_spread_cents: 5.0            # skip order if real-time spread > this (0 = disabled)
+  fee_rate_bps: 0                        # max fee rate accepted in orders (0 = protocol default)
 
 # --- Sizing (Kelly Criterion) ---
 sizing:
@@ -104,7 +115,7 @@ strategies:
       min_move_bps: 10
       hold_duration_seconds: 60
   time_decay:
-    enabled: true
+    enabled: false
     tags: []
     params:
       trigger_remaining_seconds: 0
@@ -130,6 +141,14 @@ strategies:
     enabled: false
     tags: []
     params: {}
+  sma_reversion:
+    enabled: true
+    tags: ["up-or-down"]
+    params:
+      sma_period: 20
+      min_price: 0.20
+      max_price: 0.80
+      stop_loss_cents: 2.0
 
 # --- Backtesting ---
 backtest:

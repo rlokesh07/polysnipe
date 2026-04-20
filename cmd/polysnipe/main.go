@@ -39,6 +39,7 @@ var strategyFactory = map[string]func(id string) strategy.Strategy{
 	"last_second_collapse": func(id string) strategy.Strategy { return strategy.NewLastSecondCollapse(id) },
 	"strategy_7":           func(id string) strategy.Strategy { return strategy.NewStrategy7(id) },
 	"strategy_8":           func(id string) strategy.Strategy { return strategy.NewStrategy8(id) },
+	"sma_reversion":        func(id string) strategy.Strategy { return strategy.NewSMAReversion(id) },
 }
 
 func main() {
@@ -99,18 +100,55 @@ type MarketStack struct {
 	Cancel       context.CancelFunc
 	Done         chan struct{}
 
-	priceMu   sync.Mutex
-	lastPrice float64
-	bestBid   float64
-	bestAsk   float64
+	priceMu      sync.Mutex
+	lastPrice    float64
+	bestBid      float64
+	bestAsk      float64
+	lastTick     time.Time // zero until first price update
+	priceHistory []float64 // rolling mid-price history, capped at 300
 }
+
+const maxPriceHistory = 300
 
 func (ms *MarketStack) setPrice(snap state.MarketSnapshot) {
 	ms.priceMu.Lock()
 	ms.lastPrice, _ = snap.LastPrice.Float64()
 	ms.bestBid, _ = snap.BestBid.Float64()
 	ms.bestAsk, _ = snap.BestAsk.Float64()
+	ms.lastTick = time.Now()
+
+	mid := 0.0
+	if ms.bestBid > 0 && ms.bestAsk > 0 {
+		mid = (ms.bestBid + ms.bestAsk) / 2
+	} else {
+		mid = ms.lastPrice
+	}
+	if mid > 0 {
+		ms.priceHistory = append(ms.priceHistory, mid)
+		if len(ms.priceHistory) > maxPriceHistory {
+			ms.priceHistory = ms.priceHistory[len(ms.priceHistory)-maxPriceHistory:]
+		}
+	}
 	ms.priceMu.Unlock()
+}
+
+func (ms *MarketStack) getPriceHistory() []float64 {
+	ms.priceMu.Lock()
+	defer ms.priceMu.Unlock()
+	out := make([]float64, len(ms.priceHistory))
+	copy(out, ms.priceHistory)
+	return out
+}
+
+// timeSinceLastTick returns how long ago the last price update was received.
+// If no tick has arrived yet, it measures from SubscribedAt.
+func (ms *MarketStack) timeSinceLastTick() time.Duration {
+	ms.priceMu.Lock()
+	defer ms.priceMu.Unlock()
+	if ms.lastTick.IsZero() {
+		return time.Since(ms.SubscribedAt)
+	}
+	return time.Since(ms.lastTick)
 }
 
 func (ms *MarketStack) getPrice() (lastPrice, bestBid, bestAsk float64) {
@@ -137,6 +175,15 @@ type orchestrator struct {
 }
 
 func (o *orchestrator) Positions() []executor.Position { return o.exec.Positions() }
+
+func (o *orchestrator) hasActivePosition(marketID string) bool {
+	for _, p := range o.exec.Positions() {
+		if p.MarketID == marketID {
+			return true
+		}
+	}
+	return false
+}
 func (o *orchestrator) SessionPnL() float64 {
 	v, _ := o.riskMgr.SessionPnL().Float64()
 	return v
@@ -161,8 +208,12 @@ func (o *orchestrator) LastError() string {
 	return o.lastErr
 }
 func (o *orchestrator) Balance() float64 {
-	if sim, ok := o.exec.(*executor.SimulatedExecutor); ok {
-		v, _ := sim.Balance().Float64()
+	switch ex := o.exec.(type) {
+	case *executor.SimulatedExecutor:
+		v, _ := ex.Balance().Float64()
+		return v
+	case *executor.LiveExecutor:
+		v, _ := ex.Balance().Float64()
 		return v
 	}
 	return 0
@@ -201,6 +252,7 @@ func (o *orchestrator) ActiveMarkets() []dashboard.MarketStackInfo {
 			LastPrice:    lastPrice,
 			BestBid:      bestBid,
 			BestAsk:      bestAsk,
+			PriceHistory: ms.getPriceHistory(),
 		})
 	}
 	return out
@@ -221,6 +273,19 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		sizer = sizing.NewFixedSizer(cfg.Sizing)
 	}
 
+	// marketStates holds the latest bid/ask for each subscribed market.
+	// Updated by the priceCh goroutine in subscribeMarket; read by LiveExecutor for order pricing.
+	type bidAsk struct{ bid, ask decimal.Decimal }
+	var marketStates sync.Map
+
+	getMarketState := func(marketID string) (decimal.Decimal, decimal.Decimal, bool) {
+		if v, ok := marketStates.Load(marketID); ok {
+			s := v.(bidAsk)
+			return s.bid, s.ask, s.bid.IsPositive() && s.ask.IsPositive()
+		}
+		return decimal.Zero, decimal.Zero, false
+	}
+
 	var liveExec executor.Executor
 	if cfg.DryRun {
 		logger.Warn().Msg("DRY RUN mode: using simulated executor — no real orders will be placed")
@@ -230,12 +295,12 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 			riskMgr,
 			sizer,
 			balance,
-			0,          // no fees in dry run
-			"midpoint", // fill at 0.5 mid
+			cfg.Backtest.FeeRateBPS, // fee simulation (set fee_rate_bps in backtest config)
+			"midpoint",              // fill at mid price
 			logger,
 		)
 	} else {
-		live, err := executor.NewLiveExecutor(cfg.Execution, cfg.Connection, riskMgr, sizer, balance, logger)
+		live, err := executor.NewLiveExecutor(cfg.Execution, cfg.Connection, riskMgr, sizer, balance, getMarketState, logger)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("create executor")
 		}
@@ -289,6 +354,9 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		sharedFeed.Run(ctx)
 	}()
 
+	// Declared here so subscribeMarket/unsubscribeMarket closures can reference it.
+	var discoveryEngine *discovery.Engine
+
 	// subscribeMarket spins up a state engine + strategy goroutines for one market.
 	subscribeMarket := func(cmd discovery.MarketCommand) {
 		mktID := cmd.Market.ConditionID
@@ -315,11 +383,52 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		eng := state.NewEngine(mktID, windowEnd, logger)
 
 		// Price tracker: keep latest snapshot on the stack for the dashboard.
+		// Also enforces max_spread_cents: drops the market on first valid bid/ask tick if spread is too wide.
 		priceCh := make(chan state.MarketSnapshot, 1)
 		eng.Subscribe(priceCh)
+		// Pick spread threshold: use updown override if this market has the up-or-down tag.
+		maxSpreadCents := cfg.Discovery.MaxSpreadCents
+		for _, tag := range cmd.Market.Tags {
+			if tag == "up-or-down" && cfg.Discovery.UpDownMaxSpreadCents > 0 {
+				maxSpreadCents = cfg.Discovery.UpDownMaxSpreadCents
+				break
+			}
+		}
 		go func() {
+			spreadChecked := false
 			for snap := range priceCh {
 				stack.setPrice(snap)
+				if snap.BestBid.IsPositive() && snap.BestAsk.IsPositive() {
+					marketStates.Store(mktID, bidAsk{snap.BestBid, snap.BestAsk})
+				}
+				if maxSpreadCents > 0 && !spreadChecked && snap.BestBid.IsPositive() && snap.BestAsk.IsPositive() {
+					spreadChecked = true
+					if orch.hasActivePosition(mktID) {
+						continue
+					}
+					diff := snap.BestAsk.Sub(snap.BestBid)
+					if diff.IsNegative() {
+						diff = diff.Neg()
+					}
+					spread, _ := diff.Mul(decimal.NewFromInt(100)).Float64()
+					if spread > maxSpreadCents {
+						logger.Info().
+							Str("market_id", mktID).
+							Str("question", cmd.Market.Question).
+							Float64("spread_cents", spread).
+							Float64("max_spread_cents", maxSpreadCents).
+							Msg("spread too wide; dropping market")
+						mktCancel()
+						sharedFeed.Unsubscribe(mktID)
+						if discoveryEngine != nil {
+							discoveryEngine.Forget(mktID)
+						}
+						orch.registryMu.Lock()
+						delete(orch.registry, mktID)
+						delete(orch.questions, mktID)
+						orch.registryMu.Unlock()
+					}
+				}
 			}
 		}()
 
@@ -396,6 +505,7 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 			delete(orch.questions, marketID)
 		}
 		orch.registryMu.Unlock()
+		marketStates.Delete(marketID)
 
 		if !ok {
 			return
@@ -403,6 +513,9 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 
 		stack.Cancel()
 		sharedFeed.Unsubscribe(marketID)
+		if discoveryEngine != nil {
+			discoveryEngine.Forget(marketID)
+		}
 
 		// Attempt to close any open positions for this market.
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -429,6 +542,50 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 			Msg("market torn down")
 	}
 
+	// Stale market reaper: drops markets that haven't received a price tick within the timeout.
+	if cfg.Discovery.StaleMarketTimeoutSec > 0 {
+		defaultTimeout := time.Duration(cfg.Discovery.StaleMarketTimeoutSec) * time.Second
+		upDownTimeout := defaultTimeout
+		if cfg.Discovery.UpDownStaleTimeoutSec > 0 {
+			upDownTimeout = time.Duration(cfg.Discovery.UpDownStaleTimeoutSec) * time.Second
+		}
+
+		staleTimeoutFor := func(stack *MarketStack) time.Duration {
+			for _, tag := range stack.Tags {
+				if tag == "up-or-down" {
+					return upDownTimeout
+				}
+			}
+			return defaultTimeout
+		}
+
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					orch.registryMu.RLock()
+					var stale []string
+					for id, stack := range orch.registry {
+						if stack.timeSinceLastTick() > staleTimeoutFor(stack) && !orch.hasActivePosition(id) {
+							stale = append(stale, id)
+						}
+					}
+					orch.registryMu.RUnlock()
+					for _, id := range stale {
+						logger.Info().
+							Str("market_id", id).
+							Msg("no price updates; dropping stale market")
+						unsubscribeMarket(id)
+					}
+				}
+			}
+		}()
+	}
+
 	// Start discovery engine if enabled.
 	commandCh := make(chan discovery.MarketCommand, 16)
 
@@ -445,11 +602,15 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 			discoveryStrategies[i] = s
 		}
 
-		eng := discovery.NewEngine(gammaClient, watchlists, discoveryStrategies, commandCh, pollInterval, logger)
+		var upDownAssets []string
+		if cfg.Discovery.UpDownMarkets.Enabled {
+			upDownAssets = cfg.Discovery.UpDownMarkets.Assets
+		}
+		discoveryEngine = discovery.NewEngine(gammaClient, watchlists, discoveryStrategies, commandCh, pollInterval, upDownAssets, logger)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			eng.Run(ctx)
+			discoveryEngine.Run(ctx)
 		}()
 	}
 
@@ -485,9 +646,15 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 				case discovery.Subscribe:
 					orch.registryMu.RLock()
 					_, already := orch.registry[cmd.Market.ConditionID]
+					atCap := cfg.Discovery.MaxMarkets > 0 && len(orch.registry) >= cfg.Discovery.MaxMarkets
 					orch.registryMu.RUnlock()
-					if !already {
+					if !already && !atCap {
 						subscribeMarket(cmd)
+					} else if !already && atCap {
+						logger.Debug().
+							Str("market_id", cmd.Market.ConditionID).
+							Int("max_markets", cfg.Discovery.MaxMarkets).
+							Msg("market cap reached; skipping new subscription")
 					}
 				case discovery.Unsubscribe:
 					unsubscribeMarket(cmd.Market.ConditionID)

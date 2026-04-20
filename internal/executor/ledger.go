@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/shopspring/decimal"
+
 	"polysnipe/internal/strategy"
 )
 
@@ -121,6 +123,16 @@ func (l *Ledger) OpenPositions() []Position {
 		}
 	}
 	return out
+}
+
+// UpdatePositionSize adjusts the size of an open position (used for partial fills).
+func (l *Ledger) UpdatePositionSize(strategyID, marketID string, size decimal.Decimal) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k := positionKey{strategyID, marketID}
+	if p, ok := l.positions[k]; ok {
+		p.Size = size
+	}
 }
 
 // ValidateClose checks that a Close signal is valid — the strategy must own the position.

@@ -4,15 +4,21 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/hmac"
+	crand "crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts"
-	"github.com/ethereum/go-ethereum/common/math"
+	gmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	"github.com/rs/zerolog"
@@ -26,14 +32,16 @@ import (
 
 // LiveExecutor places real orders on the Polymarket CLOB.
 type LiveExecutor struct {
-	cfg         config.ExecutionConfig
-	connCfg     config.ConnectionConfig
-	risk        *risk.Manager
-	sizer       sizing.Sizer
-	ledger      *Ledger
-	log         zerolog.Logger
-	httpClient  *http.Client
-	privateKey  *ecdsa.PrivateKey
+	cfg            config.ExecutionConfig
+	connCfg        config.ConnectionConfig
+	risk           *risk.Manager
+	sizer          sizing.Sizer
+	ledger         *Ledger
+	log            zerolog.Logger
+	httpClient     *http.Client
+	privateKey     *ecdsa.PrivateKey // wallet private key for EIP-712 order signing
+	walletAddress  string            // derived from privateKey; used as POLY_ADDRESS and order maker
+	getMarketState func(marketID string) (bid, ask decimal.Decimal, ok bool)
 
 	mu          sync.Mutex
 	balance     decimal.Decimal
@@ -47,28 +55,145 @@ func NewLiveExecutor(
 	riskMgr *risk.Manager,
 	sizer sizing.Sizer,
 	balance decimal.Decimal,
+	getMarketState func(marketID string) (bid, ask decimal.Decimal, ok bool),
 	log zerolog.Logger,
 ) (*LiveExecutor, error) {
 	var privKey *ecdsa.PrivateKey
-	if connCfg.APISecret != "" {
+	var walletAddress string
+
+	keyHex := strings.TrimPrefix(connCfg.WalletPrivateKey, "0x")
+	if keyHex == "" {
+		// Backward compat: fall back to APISecret if WalletPrivateKey not set.
+		keyHex = strings.TrimPrefix(connCfg.APISecret, "0x")
+	}
+	if keyHex != "" {
 		var err error
-		privKey, err = crypto.HexToECDSA(connCfg.APISecret)
+		privKey, err = crypto.HexToECDSA(keyHex)
 		if err != nil {
-			log.Warn().Err(err).Msg("failed to parse API secret as ECDSA key; signing disabled")
+			log.Warn().Err(err).Msg("failed to parse wallet private key; order signing disabled")
+		} else {
+			pubKey := privKey.Public().(*ecdsa.PublicKey)
+			walletAddress = crypto.PubkeyToAddress(*pubKey).Hex()
+			log.Info().Str("wallet_address", walletAddress).Msg("wallet loaded")
 		}
 	}
 
 	return &LiveExecutor{
-		cfg:        cfg,
-		connCfg:    connCfg,
-		risk:       riskMgr,
-		sizer:      sizer,
-		ledger:     NewLedger(),
-		log:        log.With().Str("component", "live_executor").Logger(),
-		httpClient: &http.Client{Timeout: time.Duration(connCfg.RequestTimeoutMS) * time.Millisecond},
-		privateKey: privKey,
-		balance:    balance,
+		cfg:            cfg,
+		connCfg:        connCfg,
+		risk:           riskMgr,
+		sizer:          sizer,
+		ledger:         NewLedger(),
+		log:            log.With().Str("component", "live_executor").Logger(),
+		httpClient:     &http.Client{Timeout: time.Duration(connCfg.RequestTimeoutMS) * time.Millisecond},
+		privateKey:     privKey,
+		walletAddress:  walletAddress,
+		balance:        balance,
+		getMarketState: getMarketState,
 	}, nil
+}
+
+// resolveOrderPrice returns the mid-price to use for a limit order.
+// It checks the real-time spread and returns an error if it exceeds MaxOrderSpreadCents.
+// Falls back to sig.Price, then 0.5 with a warning.
+func (e *LiveExecutor) resolveOrderPrice(marketID string, sigPrice decimal.Decimal) (decimal.Decimal, error) {
+	if e.getMarketState != nil {
+		bid, ask, ok := e.getMarketState(marketID)
+		if ok && bid.IsPositive() && ask.IsPositive() {
+			if e.cfg.MaxOrderSpreadCents > 0 {
+				spread, _ := ask.Sub(bid).Mul(decimal.NewFromInt(100)).Float64()
+				if spread > e.cfg.MaxOrderSpreadCents {
+					return decimal.Zero, fmt.Errorf("spread %.2f¢ > max %.2f¢ for %s; skipping",
+						spread, e.cfg.MaxOrderSpreadCents, marketID)
+				}
+			}
+			return bid.Add(ask).Div(decimal.NewFromInt(2)), nil
+		}
+	}
+	if sigPrice.IsPositive() {
+		return sigPrice, nil
+	}
+	e.log.Warn().Str("market", marketID).Msg("no market state available; pricing at 0.5")
+	return decimal.NewFromFloat(0.5), nil
+}
+
+// Balance returns the current tracked USDC balance.
+func (e *LiveExecutor) Balance() decimal.Decimal {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.balance
+}
+
+// fetchBalance retrieves the current USDC balance from the CLOB REST API.
+func (e *LiveExecutor) fetchBalance(ctx context.Context) (decimal.Decimal, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.connCfg.RESTBaseURL+"/balance", nil)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	for k, v := range e.buildL2Headers("GET", "/balance", "") {
+		req.Header.Set(k, v)
+	}
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("GET /balance: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return decimal.Zero, fmt.Errorf("GET /balance status %d: %s", resp.StatusCode, body)
+	}
+	var result struct {
+		Balance string `json:"balance"` // ⚠️ verify field name against CLOB docs
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return decimal.Zero, fmt.Errorf("parse balance: %w", err)
+	}
+	return decimal.NewFromString(result.Balance)
+}
+
+// clobOpenOrder represents an open order from the CLOB.
+type clobOpenOrder struct {
+	ID string `json:"id"` // ⚠️ verify field name against CLOB docs
+}
+
+// fetchOpenOrders returns all open orders for the current account.
+func (e *LiveExecutor) fetchOpenOrders(ctx context.Context) ([]clobOpenOrder, error) {
+	const path = "/orders"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		e.connCfg.RESTBaseURL+path+"?status=OPEN", nil) // ⚠️ verify endpoint against CLOB docs
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range e.buildL2Headers("GET", path, "") {
+		req.Header.Set(k, v)
+	}
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET /orders: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET /orders status %d: %s", resp.StatusCode, body)
+	}
+	var orders []clobOpenOrder
+	return orders, json.Unmarshal(body, &orders)
+}
+
+// reconcileOpenOrders cancels any orders left open from a prior session.
+func (e *LiveExecutor) reconcileOpenOrders(ctx context.Context) {
+	orders, err := e.fetchOpenOrders(ctx)
+	if err != nil {
+		e.log.Error().Err(err).Msg("startup reconciliation failed; orphan orders may exist")
+		return
+	}
+	for _, o := range orders {
+		e.log.Warn().Str("order_id", o.ID).Msg("cancelling orphan order from prior session")
+		if err := e.cancelOrder(ctx, o.ID); err != nil {
+			e.log.Error().Err(err).Str("order_id", o.ID).Msg("failed to cancel orphan")
+		}
+	}
+	e.log.Info().Int("cancelled", len(orders)).Msg("startup reconciliation complete")
 }
 
 // Run starts the executor goroutine.
@@ -76,6 +201,39 @@ func (e *LiveExecutor) Run(ctx context.Context, signalCh <-chan strategy.Signal,
 	e.mu.Lock()
 	e.feedbackChs = feedbackChs
 	e.mu.Unlock()
+
+	// Fetch real balance at startup.
+	if bal, err := e.fetchBalance(ctx); err != nil {
+		e.log.Error().Err(err).Msg("initial balance fetch failed; using config value")
+	} else {
+		e.mu.Lock()
+		e.balance = bal
+		e.mu.Unlock()
+		e.log.Info().Str("balance", bal.String()).Msg("USDC balance fetched from CLOB")
+	}
+
+	// Cancel any open orders left from a prior session.
+	reconCtx, reconCancel := context.WithTimeout(ctx, 15*time.Second)
+	e.reconcileOpenOrders(reconCtx)
+	reconCancel()
+
+	// Periodic balance refresh to correct drift from fee estimation.
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if bal, err := e.fetchBalance(ctx); err == nil {
+					e.mu.Lock()
+					e.balance = bal
+					e.mu.Unlock()
+				}
+			}
+		}
+	}()
 
 	e.log.Info().Msg("live executor started")
 	cooldown := time.Duration(e.cfg.CooldownBetweenOrdersMS) * time.Millisecond
@@ -132,11 +290,11 @@ func (e *LiveExecutor) handleSignal(ctx context.Context, sig strategy.Signal) er
 }
 
 func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal, size decimal.Decimal) error {
-	// Calculate limit price (mid ± offset).
-	// In a real implementation we'd look up current mid price from the state engine.
-	// For now, use a placeholder price of 0.5 with offset applied.
+	midPrice, err := e.resolveOrderPrice(sig.MarketID, sig.Price)
+	if err != nil {
+		return err
+	}
 	offsetBPS := decimal.NewFromFloat(float64(e.cfg.DefaultLimitOffsetBPS) / 10000.0)
-	midPrice := decimal.NewFromFloat(0.5)
 	var limitPrice decimal.Decimal
 	if sig.Direction == strategy.BuyYes {
 		limitPrice = midPrice.Add(midPrice.Mul(offsetBPS))
@@ -204,8 +362,18 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		closeDir = strategy.BuyYes
 	}
 
-	midPrice := decimal.NewFromFloat(0.5)
-	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, midPrice, pos.Size)
+	midPrice, err := e.resolveOrderPrice(sig.MarketID, sig.Price)
+	if err != nil {
+		return err
+	}
+	offsetBPS := decimal.NewFromFloat(float64(e.cfg.DefaultLimitOffsetBPS) / 10000.0)
+	var closePrice decimal.Decimal
+	if closeDir == strategy.BuyYes {
+		closePrice = midPrice.Add(midPrice.Mul(offsetBPS))
+	} else {
+		closePrice = midPrice.Sub(midPrice.Mul(offsetBPS))
+	}
+	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, pos.Size)
 	if err != nil {
 		return fmt.Errorf("submit close order: %w", err)
 	}
@@ -266,6 +434,10 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 
 			if state == OrderFilled {
 				e.log.Info().Str("order_id", order.ID).Msg("order filled")
+				cost := order.Price.Mul(order.FilledSize)
+				e.mu.Lock()
+				e.balance = e.balance.Sub(cost)
+				e.mu.Unlock()
 				e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
 					StrategyID:  order.StrategyID,
 					MarketID:    order.MarketID,
@@ -290,6 +462,40 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 					OrderState:  strategy.OrderCancelled,
 				})
 				return
+			}
+			if state == OrderPartialFill {
+				switch e.cfg.PartialFillAction {
+				case "cancel":
+					if err := e.cancelOrder(ctx, order.ID); err != nil {
+						e.log.Error().Err(err).Str("order_id", order.ID).Msg("cancel on partial fill failed")
+					}
+					if filled.IsPositive() {
+						e.ledger.UpdatePositionSize(order.StrategyID, order.MarketID, filled)
+						e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+							StrategyID:  order.StrategyID,
+							MarketID:    order.MarketID,
+							Status:      strategy.StatusOpen,
+							Side:        order.Side,
+							EntryPrice:  order.Price,
+							Size:        filled,
+							OpenOrderID: order.ID,
+							OrderState:  strategy.OrderPartialFill,
+						})
+					} else {
+						e.ledger.ClosePosition(order.StrategyID, order.MarketID)
+						e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+							StrategyID:  order.StrategyID,
+							MarketID:    order.MarketID,
+							Status:      strategy.StatusClosed,
+							Side:        order.Side,
+							OpenOrderID: order.ID,
+							OrderState:  strategy.OrderCancelled,
+						})
+					}
+					return
+				default: // "keep" — continue polling for full fill
+					e.ledger.UpdatePositionSize(order.StrategyID, order.MarketID, filled)
+				}
 			}
 		}
 	}
@@ -400,37 +606,84 @@ type clobOrderResponse struct {
 }
 
 func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir strategy.Direction, price, size decimal.Decimal) (string, error) {
-	side := "BUY"
+	sideInt := 0 // BUY YES tokens
 	if dir == strategy.BuyNo {
-		side = "SELL"
+		sideInt = 1 // SELL YES tokens (= buy NO)
 	}
 
-	payload := map[string]interface{}{
-		"orderType":   "GTC",
-		"tokenId":     marketID,
-		"side":        side,
-		"price":       price.String(),
-		"size":        size.String(),
-		"timeInForce": "GTC",
+	// Scale USDC amounts to 6-decimal integer representation (Polygon USDC).
+	// tokenId must be the YES token's uint256 ID from the CTF contract.
+	// ⚠️ sig.MarketID should be the YES token ID (decimal string), not the condition ID.
+	scale := decimal.NewFromInt(1_000_000)
+	var makerAmt, takerAmt decimal.Decimal
+	if sideInt == 0 { // BUY: spend USDC (makerAmount), receive YES tokens (takerAmount)
+		makerAmt = size.Mul(scale)
+		takerAmt = size.Div(price).Mul(scale)
+	} else { // SELL: spend YES tokens (makerAmount), receive USDC (takerAmount)
+		makerAmt = size.Div(price).Mul(scale)
+		takerAmt = size.Mul(scale)
+	}
+	makerAmount := makerAmt.BigInt()
+	takerAmount := takerAmt.BigInt()
+
+	// Parse tokenId: decimal string preferred; hex string (0x...) also accepted.
+	tokenID := new(big.Int)
+	tidStr := strings.TrimPrefix(marketID, "0x")
+	if len(tidStr) < len(marketID) { // had 0x prefix → hex
+		tokenID.SetString(tidStr, 16)
+	} else {
+		tokenID.SetString(marketID, 10)
 	}
 
+	// Random salt makes each order unique (required by CTF Exchange).
+	saltBytes := make([]byte, 32)
+	if _, err := crand.Read(saltBytes); err != nil {
+		return "", fmt.Errorf("generate salt: %w", err)
+	}
+	salt := new(big.Int).SetBytes(saltBytes)
+
+	// EIP-712 sign the order.
+	var sigHex string
 	if e.privateKey != nil {
-		sig, err := e.signPayload(payload)
+		var err error
+		sigHex, err = e.signOrder(orderSignInput{
+			Salt:        salt,
+			TokenID:     tokenID,
+			MakerAmount: makerAmount,
+			TakerAmount: takerAmount,
+			Side:        big.NewInt(int64(sideInt)),
+		})
 		if err != nil {
-			e.log.Warn().Err(err).Msg("EIP-712 signing failed; sending unsigned")
-		} else {
-			payload["signature"] = sig
+			e.log.Warn().Err(err).Msg("EIP-712 order signing failed; order will be rejected")
 		}
 	}
 
+	payload := map[string]interface{}{
+		"salt":          salt.String(),
+		"maker":         e.walletAddress,
+		"signer":        e.walletAddress,
+		"taker":         "0x0000000000000000000000000000000000000000",
+		"tokenId":       tokenID.String(),
+		"makerAmount":   makerAmount.String(),
+		"takerAmount":   takerAmount.String(),
+		"expiration":    "0",
+		"nonce":         "0",
+		"feeRateBps":    strconv.Itoa(e.cfg.FeeRateBPS),
+		"side":          sideInt,
+		"signatureType": 0, // EOA
+		"orderType":     "GTC",
+		"signature":     sigHex,
+	}
+
 	body, _ := json.Marshal(payload)
+	bodyStr := string(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.connCfg.RESTBaseURL+"/order", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if e.connCfg.APIKey != "" {
-		req.Header.Set("POLY_ADDRESS", e.connCfg.APIKey)
+	for k, v := range e.buildL2Headers("POST", "/order", bodyStr) {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := e.httpClient.Do(req)
@@ -441,7 +694,20 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("CLOB API error %d: %s", resp.StatusCode, string(respBody))
+		var clobErr struct {
+			Error string `json:"error"`      // ⚠️ verify field names against CLOB docs
+			Code  string `json:"error_code"`
+		}
+		_ = json.Unmarshal(respBody, &clobErr)
+		if clobErr.Code == "insufficient_balance" {
+			if bal, ferr := e.fetchBalance(context.Background()); ferr == nil {
+				e.mu.Lock()
+				e.balance = bal
+				e.mu.Unlock()
+			}
+		}
+		return "", fmt.Errorf("CLOB %d [%s]: %s (raw: %s)",
+			resp.StatusCode, clobErr.Code, clobErr.Error, string(respBody))
 	}
 
 	var orderResp clobOrderResponse
@@ -452,12 +718,13 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 }
 
 func (e *LiveExecutor) cancelOrder(ctx context.Context, orderID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, e.connCfg.RESTBaseURL+"/order/"+orderID, nil)
+	path := "/order/" + orderID
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, e.connCfg.RESTBaseURL+path, nil)
 	if err != nil {
 		return err
 	}
-	if e.connCfg.APIKey != "" {
-		req.Header.Set("POLY_ADDRESS", e.connCfg.APIKey)
+	for k, v := range e.buildL2Headers("DELETE", path, "") {
+		req.Header.Set(k, v)
 	}
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
@@ -471,9 +738,13 @@ func (e *LiveExecutor) cancelOrder(ctx context.Context, orderID string) error {
 }
 
 func (e *LiveExecutor) checkOrderStatus(ctx context.Context, orderID string) (decimal.Decimal, OrderState, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.connCfg.RESTBaseURL+"/order/"+orderID, nil)
+	path := "/order/" + orderID
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.connCfg.RESTBaseURL+path, nil)
 	if err != nil {
 		return decimal.Zero, OrderPending, err
+	}
+	for k, v := range e.buildL2Headers("GET", path, "") {
+		req.Header.Set(k, v)
 	}
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
@@ -512,38 +783,69 @@ func (e *LiveExecutor) checkOrderStatus(ctx context.Context, orderID string) (de
 	return filled, state, nil
 }
 
-// signPayload signs a JSON payload using EIP-712.
-func (e *LiveExecutor) signPayload(payload map[string]interface{}) (string, error) {
+// orderSignInput holds the typed values needed to sign a CTF Exchange order.
+type orderSignInput struct {
+	Salt        *big.Int
+	TokenID     *big.Int
+	MakerAmount *big.Int
+	TakerAmount *big.Int
+	Side        *big.Int // 0 = BUY, 1 = SELL
+}
+
+// signOrder computes the EIP-712 signature for a Polymarket CTF Exchange order.
+// Domain: "Polymarket CTF Exchange" v1, chainId 137, verifyingContract = CTF Exchange on Polygon.
+// Order struct matches the on-chain CTF Exchange contract definition.
+func (e *LiveExecutor) signOrder(o orderSignInput) (string, error) {
 	if e.privateKey == nil {
 		return "", fmt.Errorf("no private key configured")
 	}
 
-	// Build a minimal EIP-712 typed data structure for Polymarket CLOB orders.
+	addr := e.walletAddress
+	zero := big.NewInt(0)
 	typedData := apitypes.TypedData{
 		Types: apitypes.Types{
 			"EIP712Domain": []apitypes.Type{
 				{Name: "name", Type: "string"},
 				{Name: "version", Type: "string"},
 				{Name: "chainId", Type: "uint256"},
+				{Name: "verifyingContract", Type: "address"},
 			},
 			"Order": []apitypes.Type{
-				{Name: "orderType", Type: "string"},
-				{Name: "tokenId", Type: "string"},
-				{Name: "side", Type: "string"},
-				{Name: "price", Type: "string"},
-				{Name: "size", Type: "string"},
+				{Name: "salt", Type: "uint256"},
+				{Name: "maker", Type: "address"},
+				{Name: "signer", Type: "address"},
+				{Name: "taker", Type: "address"},
+				{Name: "tokenId", Type: "uint256"},
+				{Name: "makerAmount", Type: "uint256"},
+				{Name: "takerAmount", Type: "uint256"},
+				{Name: "expiration", Type: "uint256"},
+				{Name: "nonce", Type: "uint256"},
+				{Name: "feeRateBps", Type: "uint256"},
+				{Name: "side", Type: "uint8"},
+				{Name: "signatureType", Type: "uint8"},
 			},
 		},
 		PrimaryType: "Order",
 		Domain: apitypes.TypedDataDomain{
-			Name:    "Polymarket CLOB",
-			Version: "1",
-			ChainId: math.NewHexOrDecimal256(137), // Polygon
+			Name:              "Polymarket CTF Exchange",
+			Version:           "1",
+			ChainId:           gmath.NewHexOrDecimal256(137),
+			VerifyingContract: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
 		},
-		Message: apitypes.TypedDataMessage{},
-	}
-	for k, v := range payload {
-		typedData.Message[k] = v
+		Message: apitypes.TypedDataMessage{
+			"salt":          o.Salt,
+			"maker":         addr,
+			"signer":        addr,
+			"taker":         "0x0000000000000000000000000000000000000000",
+			"tokenId":       o.TokenID,
+			"makerAmount":   o.MakerAmount,
+			"takerAmount":   o.TakerAmount,
+			"expiration":    zero,
+			"nonce":         zero,
+			"feeRateBps":    big.NewInt(int64(e.cfg.FeeRateBPS)),
+			"side":          o.Side,
+			"signatureType": zero, // EOA = 0
+		},
 	}
 
 	hash, _, err := apitypes.TypedDataAndHash(typedData)
@@ -551,12 +853,50 @@ func (e *LiveExecutor) signPayload(payload map[string]interface{}) (string, erro
 		return "", fmt.Errorf("EIP-712 hash: %w", err)
 	}
 
-	sig, err := crypto.Sign(accounts.TextHash(hash), e.privateKey)
+	// Sign the EIP-712 hash directly — do NOT use accounts.TextHash, which would
+	// double-prefix an already-prefixed hash.
+	sig, err := crypto.Sign(hash, e.privateKey)
 	if err != nil {
 		return "", fmt.Errorf("sign: %w", err)
 	}
-	// Adjust v for EIP-712 (v = 27 or 28)
-	sig[64] += 27
+	sig[64] += 27 // adjust v to 27/28 as expected by Solidity ecrecover
 
 	return fmt.Sprintf("0x%x", sig), nil
+}
+
+// buildL2Headers computes the HMAC-SHA256 L2 authentication headers required by
+// Polymarket's CLOB API for all authenticated endpoints.
+// message = timestamp + METHOD + requestPath + body (single quotes → double quotes)
+// key     = base64url-decoded APISecret
+// sig     = HMAC-SHA256(key, message) → base64url-encoded
+func (e *LiveExecutor) buildL2Headers(method, path, body string) map[string]string {
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	msg := ts + strings.ToUpper(method) + path
+	if body != "" {
+		msg += strings.ReplaceAll(body, "'", `"`)
+	}
+
+	// Decode the API secret (base64url, possibly without padding).
+	key, err := base64.RawURLEncoding.DecodeString(e.connCfg.APISecret)
+	if err != nil {
+		// Fall back to standard URL encoding with padding.
+		key, _ = base64.URLEncoding.DecodeString(e.connCfg.APISecret)
+	}
+
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(msg))
+	sig := base64.URLEncoding.EncodeToString(mac.Sum(nil))
+	sig = strings.NewReplacer("+", "-", "/", "_").Replace(sig)
+
+	addr := e.walletAddress
+	if addr == "" {
+		addr = e.connCfg.APIKey // backward compat if no private key configured
+	}
+	return map[string]string{
+		"POLY_ADDRESS":    addr,
+		"POLY_SIGNATURE":  sig,
+		"POLY_TIMESTAMP":  ts,
+		"POLY_API_KEY":    e.connCfg.APIKey,
+		"POLY_PASSPHRASE": e.connCfg.Passphrase,
+	}
 }

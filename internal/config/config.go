@@ -23,9 +23,10 @@ type Config struct {
 type ConnectionConfig struct {
 	WebSocketURL           string `yaml:"websocket_url"`
 	RESTBaseURL            string `yaml:"rest_base_url"`
-	APIKey                 string `yaml:"api_key"`
-	APISecret              string `yaml:"api_secret"`
-	Passphrase             string `yaml:"passphrase"`
+	WalletPrivateKey       string `yaml:"wallet_private_key"` // hex private key — EIP-712 order signing, derives POLY_ADDRESS
+	APIKey                 string `yaml:"api_key"`            // derived Polymarket API key — POLY_API_KEY L2 header
+	APISecret              string `yaml:"api_secret"`         // derived API secret (base64url) — HMAC L2 signing key
+	Passphrase             string `yaml:"passphrase"`         // derived passphrase — POLY_PASSPHRASE L2 header
 	ReconnectMaxRetries    int    `yaml:"reconnect_max_retries"`
 	ReconnectBackoffBaseMS int    `yaml:"reconnect_backoff_base_ms"`
 	ReconnectBackoffMaxMS  int    `yaml:"reconnect_backoff_max_ms"`
@@ -38,7 +39,19 @@ type DiscoveryConfig struct {
 	PollIntervalSec    int               `yaml:"poll_interval_seconds"`
 	GammaAPIURL        string            `yaml:"gamma_api_url"`
 	RateLimitPerSecond int               `yaml:"rate_limit_per_second"`
-	Watchlists         []WatchlistConfig `yaml:"watchlists"`
+	MaxMarkets            int                  `yaml:"max_markets"`               // 0 = unlimited
+	MaxSpreadCents        float64              `yaml:"max_spread_cents"`          // 0 = disabled; drops market if spread > this on first tick
+	UpDownMaxSpreadCents  float64              `yaml:"updown_max_spread_cents"`   // spread threshold override for up-or-down markets (0 = use max_spread_cents)
+	StaleMarketTimeoutSec       int                  `yaml:"stale_market_timeout_sec"`        // drop market if no price tick within this window (0 = disabled)
+	UpDownStaleTimeoutSec       int                  `yaml:"updown_stale_timeout_sec"`        // stale timeout override for up-or-down markets (0 = use stale_market_timeout_sec)
+	UpDownMarkets         UpDownMarketsConfig  `yaml:"updown_markets"`
+	Watchlists            []WatchlistConfig    `yaml:"watchlists"`
+}
+
+// UpDownMarketsConfig configures the slug-based Up/Down crypto market discovery.
+type UpDownMarketsConfig struct {
+	Enabled bool     `yaml:"enabled"`
+	Assets  []string `yaml:"assets"` // e.g. ["btc", "eth", "sol"] — must match slug prefixes
 }
 
 // WatchlistConfig is a single watchlist definition from config.
@@ -67,7 +80,9 @@ type ExecutionConfig struct {
 	RetryOnFailure          bool   `yaml:"retry_on_failure"`
 	RetryMaxAttempts        int    `yaml:"retry_max_attempts"`
 	RetryBackoffMS          int    `yaml:"retry_backoff_ms"`
-	CooldownBetweenOrdersMS int    `yaml:"cooldown_between_orders_ms"`
+	CooldownBetweenOrdersMS int     `yaml:"cooldown_between_orders_ms"`
+	MaxOrderSpreadCents     float64 `yaml:"max_order_spread_cents"`
+	FeeRateBPS              int     `yaml:"fee_rate_bps"`
 }
 
 type SizingConfig struct {

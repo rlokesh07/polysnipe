@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,7 +20,9 @@ type Strategy interface {
 type Engine struct {
 	gamma        *gamma.Client
 	watchlists   []Watchlist
+	upDown       *upDownDiscovery // nil if disabled
 	strategies   []strategyTagReader
+	mu           sync.Mutex
 	registry     map[string]bool // conditionID → currently subscribed
 	commandCh    chan<- MarketCommand
 	pollInterval time.Duration
@@ -33,13 +36,14 @@ func NewEngine(
 	strategies []Strategy,
 	commandCh chan<- MarketCommand,
 	pollInterval time.Duration,
+	upDownAssets []string,
 	log zerolog.Logger,
 ) *Engine {
 	readers := make([]strategyTagReader, len(strategies))
 	for i, s := range strategies {
 		readers[i] = s
 	}
-	return &Engine{
+	e := &Engine{
 		gamma:        gc,
 		watchlists:   watchlists,
 		strategies:   readers,
@@ -48,6 +52,10 @@ func NewEngine(
 		pollInterval: pollInterval,
 		log:          log.With().Str("component", "discovery").Logger(),
 	}
+	if len(upDownAssets) > 0 {
+		e.upDown = newUpDownDiscovery(gc, upDownAssets, log)
+	}
+	return e
 }
 
 // Run starts the poll loop. It exits when ctx is cancelled.
@@ -70,6 +78,15 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
+// Forget removes a market from the engine's registry so it will be re-discovered
+// and re-subscribed on the next poll. Call this when the orchestrator drops a market
+// externally (e.g. stale timeout, spread filter).
+func (e *Engine) Forget(conditionID string) {
+	e.mu.Lock()
+	delete(e.registry, conditionID)
+	e.mu.Unlock()
+}
+
 func (e *Engine) poll(ctx context.Context) {
 	active := true
 	closed := false
@@ -89,12 +106,15 @@ func (e *Engine) poll(ctx context.Context) {
 				if !mkt.Active || mkt.Closed {
 					continue
 				}
-				for _, wl := range e.watchlists {
-					if wl.matchesWatchlist(mkt) {
-						currentlyActive[mkt.ConditionID] = mkt
-						break
+				if !hasMeaningfulPrice(mkt.OutcomePrices) {
+						continue // no live price data in Gamma; skip before subscribing
 					}
-				}
+					for _, wl := range e.watchlists {
+						if wl.matchesWatchlist(mkt) {
+							currentlyActive[mkt.ConditionID] = mkt
+							break
+						}
+					}
 			}
 		}
 		return true
@@ -125,7 +145,19 @@ func (e *Engine) poll(ctx context.Context) {
 		}
 	}
 
+	// Slug-based Up/Down discovery: runs alongside watchlists.
+	if e.upDown != nil {
+		for _, mkt := range e.upDown.poll(ctx) {
+			if !hasMeaningfulPrice(mkt.OutcomePrices) {
+				continue
+			}
+			currentlyActive[mkt.ConditionID] = mkt
+		}
+	}
+
 	e.log.Debug().Int("matching_markets", len(currentlyActive)).Msg("gamma poll completed")
+
+	e.mu.Lock()
 
 	// Subscribe to newly discovered markets.
 	for condID, gm := range currentlyActive {
@@ -155,6 +187,7 @@ func (e *Engine) poll(ctx context.Context) {
 				Strs("matched_strategies", matched).
 				Msg("market discovered; subscribing")
 		case <-ctx.Done():
+			e.mu.Unlock()
 			return
 		}
 	}
@@ -178,9 +211,27 @@ func (e *Engine) poll(ctx context.Context) {
 				Str("market_id", condID).
 				Msg("market no longer active; unsubscribing")
 		case <-ctx.Done():
+			e.mu.Unlock()
 			return
 		}
 	}
+
+	e.mu.Unlock()
+}
+
+// hasMeaningfulPrice returns true if outcomePrices contains at least one non-trivial price,
+// indicating the market has active price discovery. Markets with empty, zero, or purely
+// 50/50 prices are skipped — the WebSocket will not stream meaningful data for them.
+func hasMeaningfulPrice(prices []string) bool {
+	if len(prices) < 2 {
+		return false
+	}
+	for _, p := range prices {
+		if p != "" && p != "0" && p != "0.5" && p != "0.50" {
+			return true
+		}
+	}
+	return false
 }
 
 // uniqueWatchlistTags returns deduplicated tag slugs across all watchlists.

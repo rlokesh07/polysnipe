@@ -43,6 +43,7 @@ type MarketStackInfo struct {
 	LastPrice    float64
 	BestBid      float64
 	BestAsk      float64
+	PriceHistory []float64
 }
 
 // Server is the dashboard HTTP + WebSocket server.
@@ -172,20 +173,40 @@ func (s *Server) broadcastStatus() {
 }
 
 func (s *Server) buildStatus() map[string]interface{} {
+	activeMarkets := s.state.ActiveMarkets()
+
+	// Build lookup for position enrichment.
+	mktLookup := make(map[string]MarketStackInfo, len(activeMarkets))
+	for _, m := range activeMarkets {
+		mktLookup[m.MarketID] = m
+	}
+
 	positions := s.state.Positions()
 	posData := make([]map[string]interface{}, 0, len(positions))
 	for _, p := range positions {
+		question := p.MarketID
+		var currentPrice float64
+		if m, ok := mktLookup[p.MarketID]; ok {
+			if m.Question != "" {
+				question = m.Question
+			}
+			if m.BestBid > 0 && m.BestAsk > 0 {
+				currentPrice = (m.BestBid + m.BestAsk) / 2
+			} else {
+				currentPrice = m.LastPrice
+			}
+		}
 		posData = append(posData, map[string]interface{}{
-			"strategy_id": p.StrategyID,
-			"market_id":   p.MarketID,
-			"side":        p.Side.String(),
-			"entry_price": p.EntryPrice.String(),
-			"size":        p.Size.String(),
-			"status":      fmt.Sprintf("%d", p.Status),
+			"strategy_id":   p.StrategyID,
+			"market_id":     p.MarketID,
+			"question":      question,
+			"side":          p.Side.String(),
+			"entry_price":   p.EntryPrice.String(),
+			"current_price": fmt.Sprintf("%.4f", currentPrice),
+			"size":          p.Size.String(),
+			"status":        fmt.Sprintf("%d", p.Status),
 		})
 	}
-
-	activeMarkets := s.state.ActiveMarkets()
 	mktData := make([]map[string]interface{}, 0, len(activeMarkets))
 	for _, m := range activeMarkets {
 		mktData = append(mktData, map[string]interface{}{
@@ -198,6 +219,7 @@ func (s *Server) buildStatus() map[string]interface{} {
 			"last_price":    m.LastPrice,
 			"best_bid":      m.BestBid,
 			"best_ask":      m.BestAsk,
+			"price_history": m.PriceHistory,
 		})
 	}
 

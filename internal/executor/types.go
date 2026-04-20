@@ -45,6 +45,7 @@ type Position struct {
 	Side        strategy.Direction
 	EntryPrice  decimal.Decimal
 	Size        decimal.Decimal
+	EntryFee    decimal.Decimal // fee paid at entry, used for accurate PnL reporting
 	OpenOrderID string
 	Status      strategy.PositionStatus
 }

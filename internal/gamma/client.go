@@ -52,14 +52,24 @@ func (c *Client) ListEvents(ctx context.Context, opts ListEventsOpts) ([]GammaEv
 	return c.fetchAllEvents(ctx, opts)
 }
 
-// GetEventBySlug returns an event by its slug.
+// GetEventBySlug returns an event by its slug, or nil if not found.
 func (c *Client) GetEventBySlug(ctx context.Context, slug string) (*GammaEvent, error) {
-	var ev GammaEvent
-	if err := c.get(ctx, "/events/slug/"+slug, nil, &ev); err != nil {
+	params := url.Values{}
+	params.Set("slug", slug)
+	var events []GammaEvent
+	if err := c.get(ctx, "/events", params, &events); err != nil {
 		return nil, err
 	}
-	parseEventDates(&ev)
-	return &ev, nil
+	if len(events) == 0 {
+		return nil, nil
+	}
+	ev := &events[0]
+	parseEventDates(ev)
+	for i := range ev.Markets {
+		ev.Markets[i].Tags = ev.Tags
+		parseMarketDates(&ev.Markets[i])
+	}
+	return ev, nil
 }
 
 // ListTags returns all available tags.

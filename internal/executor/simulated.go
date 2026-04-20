@@ -147,6 +147,7 @@ func (e *SimulatedExecutor) simulateEntry(sig strategy.Signal, size decimal.Deci
 		Side:        sig.Direction,
 		EntryPrice:  fillPrice,
 		Size:        size,
+		EntryFee:    fee,
 		OpenOrderID: orderID,
 		Status:      strategy.StatusOpen,
 	}
@@ -215,10 +216,15 @@ func (e *SimulatedExecutor) simulateClose(sig strategy.Signal) {
 		closePriceForSide = one.Sub(closePrice)
 	}
 	contracts := pos.Size.Div(pos.EntryPrice)
-	pnl := contracts.Mul(closePriceForSide).Sub(pos.Size).Sub(fee)
+	proceeds := contracts.Mul(closePriceForSide)
+
+	// Reported PnL includes both entry and close fees for accurate trade accounting.
+	// entryFee was already deducted from balance at open, so only closeFee is
+	// deducted here for the balance update to avoid double-counting.
+	pnl := proceeds.Sub(pos.Size).Sub(pos.EntryFee).Sub(fee)
 
 	e.mu.Lock()
-	e.balance = e.balance.Add(pos.Size).Add(pnl)
+	e.balance = e.balance.Add(proceeds).Sub(fee) // entry already paid entryFee
 	e.mu.Unlock()
 
 	e.risk.RecordClose(sig.StrategyID, sig.MarketID, pos.Size, pnl)
