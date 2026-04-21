@@ -7,7 +7,8 @@
 connection:
   websocket_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
   rest_base_url: "https://clob.polymarket.com"
-  wallet_private_key: "${POLYMARKET_WALLET_KEY}"  # hex private key — signs orders + derives POLY_ADDRESS
+  wallet_private_key: "${POLYMARKET_WALLET_KEY}"  # hex private key — Phantom EOA, signs orders
+  funder_address: "${POLYMARKET_FUNDER_ADDRESS}"  # Gnosis Safe proxy address shown on polymarket.com/profile
   api_key: "${POLYMARKET_API_KEY}"                # derived via py-clob-client — POLY_API_KEY L2 header
   api_secret: "${POLYMARKET_API_SECRET}"          # derived base64url secret — HMAC L2 signing key
   passphrase: "${POLYMARKET_PASSPHRASE}"          # derived passphrase — POLY_PASSPHRASE L2 header

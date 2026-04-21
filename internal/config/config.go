@@ -23,7 +23,8 @@ type Config struct {
 type ConnectionConfig struct {
 	WebSocketURL           string `yaml:"websocket_url"`
 	RESTBaseURL            string `yaml:"rest_base_url"`
-	WalletPrivateKey       string `yaml:"wallet_private_key"` // hex private key — EIP-712 order signing, derives POLY_ADDRESS
+	WalletPrivateKey       string `yaml:"wallet_private_key"` // hex private key — EIP-712 order signing, derives signer address
+	FunderAddress          string `yaml:"funder_address"`     // Gnosis Safe proxy shown on polymarket.com/profile; order maker + balance owner
 	APIKey                 string `yaml:"api_key"`            // derived Polymarket API key — POLY_API_KEY L2 header
 	APISecret              string `yaml:"api_secret"`         // derived API secret (base64url) — HMAC L2 signing key
 	Passphrase             string `yaml:"passphrase"`         // derived passphrase — POLY_PASSPHRASE L2 header

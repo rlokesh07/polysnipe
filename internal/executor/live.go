@@ -39,8 +39,9 @@ type LiveExecutor struct {
 	ledger         *Ledger
 	log            zerolog.Logger
 	httpClient     *http.Client
-	privateKey     *ecdsa.PrivateKey // wallet private key for EIP-712 order signing
-	walletAddress  string            // derived from privateKey; used as POLY_ADDRESS and order maker
+	privateKey     *ecdsa.PrivateKey // Phantom EOA key — EIP-712 signer
+	walletAddress  string            // EOA address derived from privateKey — order signer
+	funderAddress  string            // Gnosis Safe proxy from config — order maker + balance owner
 	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool)
 
 	mu          sync.Mutex
@@ -88,6 +89,7 @@ func NewLiveExecutor(
 		httpClient:     &http.Client{Timeout: time.Duration(connCfg.RequestTimeoutMS) * time.Millisecond},
 		privateKey:     privKey,
 		walletAddress:  walletAddress,
+		funderAddress:  connCfg.FunderAddress,
 		balance:        balance,
 		getMarketState: getMarketState,
 	}, nil
@@ -162,7 +164,7 @@ type clobOpenOrder struct {
 func (e *LiveExecutor) fetchOpenOrders(ctx context.Context) ([]clobOpenOrder, error) {
 	const path = "/data/orders"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		e.connCfg.RESTBaseURL+path+"?maker="+e.walletAddress+"&status=OPEN", nil)
+		e.connCfg.RESTBaseURL+path+"?maker="+e.funderAddress+"&status=OPEN", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -673,7 +675,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 
 	payload := map[string]interface{}{
 		"salt":          salt.String(),
-		"maker":         e.walletAddress,
+		"maker":         e.funderAddress,
 		"signer":        e.walletAddress,
 		"taker":         "0x0000000000000000000000000000000000000000",
 		"tokenId":       tokenID.String(),
@@ -683,7 +685,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 		"nonce":         "0",
 		"feeRateBps":    strconv.Itoa(e.cfg.FeeRateBPS),
 		"side":          sideInt,
-		"signatureType": 0, // EOA
+		"signatureType": 2, // GNOSIS_SAFE
 		"orderType":     "GTC",
 		"signature":     sigHex,
 	}
@@ -813,7 +815,6 @@ func (e *LiveExecutor) signOrder(o orderSignInput) (string, error) {
 		return "", fmt.Errorf("no private key configured")
 	}
 
-	addr := e.walletAddress
 	zero := big.NewInt(0)
 	typedData := apitypes.TypedData{
 		Types: apitypes.Types{
@@ -847,8 +848,8 @@ func (e *LiveExecutor) signOrder(o orderSignInput) (string, error) {
 		},
 		Message: apitypes.TypedDataMessage{
 			"salt":          o.Salt,
-			"maker":         addr,
-			"signer":        addr,
+			"maker":         e.funderAddress,
+			"signer":        e.walletAddress,
 			"taker":         "0x0000000000000000000000000000000000000000",
 			"tokenId":       o.TokenID,
 			"makerAmount":   o.MakerAmount,
@@ -857,7 +858,7 @@ func (e *LiveExecutor) signOrder(o orderSignInput) (string, error) {
 			"nonce":         zero,
 			"feeRateBps":    big.NewInt(int64(e.cfg.FeeRateBPS)),
 			"side":          o.Side,
-			"signatureType": zero, // EOA = 0
+			"signatureType": big.NewInt(2), // GNOSIS_SAFE
 		},
 	}
 
