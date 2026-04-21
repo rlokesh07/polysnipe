@@ -678,20 +678,23 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	}
 
 	payload := map[string]interface{}{
-		"salt":          salt.String(),
-		"maker":         e.funderAddress,
-		"signer":        e.walletAddress,
-		"taker":         "0x0000000000000000000000000000000000000000",
-		"tokenId":       tokenID.String(),
-		"makerAmount":   makerAmount.String(),
-		"takerAmount":   takerAmount.String(),
-		"expiration":    "0",
-		"nonce":         "0",
-		"feeRateBps":    strconv.Itoa(e.cfg.FeeRateBPS),
-		"side":          sideInt,
-		"signatureType": 2, // GNOSIS_SAFE
-		"orderType":     "GTC",
-		"signature":     sigHex,
+		"order": map[string]interface{}{
+			"salt":          salt.String(),
+			"maker":         e.funderAddress,
+			"signer":        e.walletAddress,
+			"taker":         "0x0000000000000000000000000000000000000000",
+			"tokenId":       tokenID.String(),
+			"makerAmount":   makerAmount.String(),
+			"takerAmount":   takerAmount.String(),
+			"expiration":    "0",
+			"nonce":         "0",
+			"feeRateBps":    strconv.Itoa(e.cfg.FeeRateBPS),
+			"side":          sideInt,
+			"signatureType": 2, // GNOSIS_SAFE
+			"signature":     sigHex,
+		},
+		"owner":     e.connCfg.APIKey,
+		"orderType": "GTC",
 	}
 
 	body, _ := json.Marshal(payload)
