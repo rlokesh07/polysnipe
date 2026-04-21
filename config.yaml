@@ -149,7 +149,7 @@ strategies:
       sma_period: 20
       min_price: 0.20
       max_price: 0.80
-      stop_loss_cents: 2.0
+      stop_loss_cents: 10.0
 
 # --- Backtesting ---
 backtest:

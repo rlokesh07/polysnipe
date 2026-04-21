@@ -277,17 +277,18 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 	// Keyed by conditionID; updated by subscribeMarket; read by LiveExecutor for order pricing and signing.
 	type marketStateEntry struct {
 		bid, ask   decimal.Decimal
-		tokenIDYes string // YES token uint256 ID (decimal string) — required for CTF Exchange orders
+		tokenIDYes string
+		tokenIDNo  string
 		negRisk    bool
 	}
 	var marketStates sync.Map
 
-	getMarketState := func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool) {
+	getMarketState := func(marketID string) (bid, ask decimal.Decimal, tokenIDYes, tokenIDNo string, ok bool) {
 		if v, ok := marketStates.Load(marketID); ok {
 			s := v.(marketStateEntry)
-			return s.bid, s.ask, s.tokenIDYes, s.bid.IsPositive() && s.ask.IsPositive()
+			return s.bid, s.ask, s.tokenIDYes, s.tokenIDNo, s.bid.IsPositive() && s.ask.IsPositive()
 		}
-		return decimal.Zero, decimal.Zero, "", false
+		return decimal.Zero, decimal.Zero, "", "", false
 	}
 
 	isNegRisk := func(marketID string) bool {
@@ -414,7 +415,8 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 						bid:        snap.BestBid,
 						ask:        snap.BestAsk,
 						tokenIDYes: cmd.Market.TokenIDYes,
-					negRisk:    cmd.Market.NegRisk,
+						tokenIDNo:  cmd.Market.TokenIDNo,
+						negRisk:    cmd.Market.NegRisk,
 					})
 				}
 				if maxSpreadCents > 0 && !spreadChecked && snap.BestBid.IsPositive() && snap.BestAsk.IsPositive() {

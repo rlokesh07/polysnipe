@@ -10,9 +10,11 @@ import (
 type Direction int
 
 const (
-	BuyYes Direction = iota
+	BuyYes  Direction = iota
 	BuyNo
 	Close
+	SellYes // exit a BuyYes position: SELL YES tokens back for USDC
+	SellNo  // exit a BuyNo position: SELL NO tokens back for USDC
 )
 
 func (d Direction) String() string {
@@ -23,6 +25,10 @@ func (d Direction) String() string {
 		return "BuyNo"
 	case Close:
 		return "Close"
+	case SellYes:
+		return "SellYes"
+	case SellNo:
+		return "SellNo"
 	default:
 		return "Unknown"
 	}

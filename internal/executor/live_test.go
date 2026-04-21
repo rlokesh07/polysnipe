@@ -391,10 +391,10 @@ func TestResolveOrderPrice(t *testing.T) {
 				config.ExecutionConfig{MaxOrderSpreadCents: tt.maxSpreadCents},
 				config.ConnectionConfig{},
 				nil, nil, decimal.Zero,
-				func(marketID string) (decimal.Decimal, decimal.Decimal, string, bool) {
+				func(marketID string) (decimal.Decimal, decimal.Decimal, string, string, bool) {
 					bid := decimal.NewFromFloat(tt.bid)
 					ask := decimal.NewFromFloat(tt.ask)
-					return bid, ask, "", bid.IsPositive() && ask.IsPositive()
+					return bid, ask, "", "", bid.IsPositive() && ask.IsPositive()
 				},
 				nil, // isNegRisk
 				zerolog.Nop(),

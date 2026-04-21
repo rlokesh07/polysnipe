@@ -43,7 +43,7 @@ type LiveExecutor struct {
 	privateKey     *ecdsa.PrivateKey // Phantom EOA key — EIP-712 signer
 	walletAddress  string            // EOA address derived from privateKey — order signer
 	funderAddress  string            // Gnosis Safe proxy from config — order maker + balance owner
-	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool)
+	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes, tokenIDNo string, ok bool)
 	isNegRisk      func(marketID string) bool
 	negRiskCache   sync.Map // tokenID string → bool
 	feeRateCache   sync.Map // tokenID string → int
@@ -60,7 +60,7 @@ func NewLiveExecutor(
 	riskMgr *risk.Manager,
 	sizer sizing.Sizer,
 	balance decimal.Decimal,
-	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool),
+	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes, tokenIDNo string, ok bool),
 	isNegRisk func(marketID string) bool,
 	log zerolog.Logger,
 ) (*LiveExecutor, error) {
@@ -106,7 +106,7 @@ func NewLiveExecutor(
 // Falls back to sig.Price, then 0.5 with a warning.
 func (e *LiveExecutor) resolveOrderPrice(marketID string, sigPrice decimal.Decimal) (decimal.Decimal, error) {
 	if e.getMarketState != nil {
-		bid, ask, _, ok := e.getMarketState(marketID)
+		bid, ask, _, _, ok := e.getMarketState(marketID)
 		if ok && bid.IsPositive() && ask.IsPositive() {
 			if e.cfg.MaxOrderSpreadCents > 0 {
 				spread, _ := ask.Sub(bid).Mul(decimal.NewFromInt(100)).Float64()
@@ -352,7 +352,16 @@ func (e *LiveExecutor) handleSignal(ctx context.Context, sig strategy.Signal) er
 		return fmt.Errorf("risk check failed: %w", err)
 	}
 
-	return e.placeEntryOrder(ctx, sig, size)
+	if err := e.placeEntryOrder(ctx, sig, size); err != nil {
+		// Notify the strategy so it resets hasPos and can re-enter later.
+		e.sendFeedback(sig.StrategyID, strategy.PositionUpdate{
+			StrategyID: sig.StrategyID,
+			MarketID:   sig.MarketID,
+			Status:     strategy.StatusNone,
+		})
+		return err
+	}
+	return nil
 }
 
 func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal, size decimal.Decimal) error {
@@ -422,23 +431,19 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		return fmt.Errorf("no position to close")
 	}
 
-	// Close direction is opposite of entry.
-	closeDir := strategy.BuyNo
+	// Exit sells back the same token that was bought at entry.
+	closeDir := strategy.SellYes
 	if pos.Side == strategy.BuyNo {
-		closeDir = strategy.BuyYes
+		closeDir = strategy.SellNo
 	}
 
 	midPrice, err := e.resolveOrderPrice(sig.MarketID, sig.Price)
 	if err != nil {
 		return err
 	}
+	// Selling: offer slightly below mid to increase fill probability.
 	offsetBPS := decimal.NewFromFloat(float64(e.cfg.DefaultLimitOffsetBPS) / 10000.0)
-	var closePrice decimal.Decimal
-	if closeDir == strategy.BuyYes {
-		closePrice = midPrice.Add(midPrice.Mul(offsetBPS))
-	} else {
-		closePrice = midPrice.Sub(midPrice.Mul(offsetBPS))
-	}
+	closePrice := midPrice.Sub(midPrice.Mul(offsetBPS))
 	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, pos.Size)
 	if err != nil {
 		return fmt.Errorf("submit close order: %w", err)
@@ -457,6 +462,21 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		OpenOrderID: orderID,
 		OrderState:  strategy.OrderPending,
 	})
+
+	// Monitor the close order so it gets cancelled if it doesn't fill in time.
+	closeOrder := Order{
+		ID:         orderID,
+		StrategyID: sig.StrategyID,
+		MarketID:   sig.MarketID,
+		Side:       closeDir,
+		Price:      closePrice,
+		Size:       pos.Size,
+		State:      OrderPending,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	e.ledger.AddOrder(closeOrder)
+	go e.monitorOrder(ctx, closeOrder)
 	return nil
 }
 
@@ -678,12 +698,18 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 		price = decimal.NewFromFloat(0.01)
 	}
 
-	sideInt := 0 // BUY YES tokens
+	// BuyYes  → BUY  YES token (spend USDC)
+	// BuyNo   → BUY  NO  token (spend USDC)
+	// SellYes → SELL YES token (receive USDC) — used to exit a BuyYes position
+	// SellNo  → SELL NO  token (receive USDC) — used to exit a BuyNo  position
+	isSell := dir == strategy.SellYes || dir == strategy.SellNo
+	sideInt := 0
 	sideStr := "BUY"
-	if dir == strategy.BuyNo {
-		sideInt = 1 // SELL YES tokens (= buy NO)
+	if isSell {
+		sideInt = 1
 		sideStr = "SELL"
 	}
+	buyNo := dir == strategy.BuyNo || dir == strategy.SellNo
 
 	// CLOB precision rules:
 	//   token amounts must be multiples of 10000 (2 decimal places at 1e6 scale)
@@ -710,13 +736,19 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 		takerAmount = usdcAmt.BigInt()
 	}
 
-	// Resolve YES token ID from the market state store (set by discovery engine).
-	// Both BUY and SELL orders use the YES token ID; direction is indicated by the side field.
+	// Resolve the correct token ID: YES token for BuyYes, NO token for BuyNo.
+	// BuyNo places a BUY order on the NO token (USDC → NO), not a SELL on YES.
 	tokenID := new(big.Int)
 	if e.getMarketState != nil {
-		_, _, tokenIDYes, ok := e.getMarketState(marketID)
-		if ok && tokenIDYes != "" {
-			tokenID.SetString(tokenIDYes, 10)
+		_, _, tokenIDYes, tokenIDNo, ok := e.getMarketState(marketID)
+		if ok {
+			pick := tokenIDYes
+			if buyNo && tokenIDNo != "" {
+				pick = tokenIDNo
+			}
+			if pick != "" {
+				tokenID.SetString(pick, 10)
+			}
 		}
 	}
 	if tokenID.Sign() == 0 {
