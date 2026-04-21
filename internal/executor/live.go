@@ -45,6 +45,7 @@ type LiveExecutor struct {
 	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool)
 	isNegRisk      func(marketID string) bool
 	negRiskCache   sync.Map // tokenID string → bool
+	feeRateCache   sync.Map // tokenID string → int
 
 	mu          sync.Mutex
 	balance     decimal.Decimal
@@ -187,6 +188,32 @@ func (e *LiveExecutor) resolveNegRisk(ctx context.Context, tokenID string) bool 
 	}
 	e.negRiskCache.Store(tokenID, result.NegRisk)
 	return result.NegRisk
+}
+
+// resolveFeeRate returns the base fee rate in bps for a token, querying the CLOB if not cached.
+func (e *LiveExecutor) resolveFeeRate(ctx context.Context, tokenID string) int {
+	if v, ok := e.feeRateCache.Load(tokenID); ok {
+		return v.(int)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		e.connCfg.RESTBaseURL+"/fee-rate?token_id="+tokenID, nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		BaseFee int `json:"base_fee"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0
+	}
+	e.feeRateCache.Store(tokenID, result.BaseFee)
+	return result.BaseFee
 }
 
 // clobOpenOrder represents an open order from the CLOB.
@@ -694,7 +721,8 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	salt := new(big.Int).SetBytes(saltBytes)
 
 	negRisk := e.resolveNegRisk(ctx, tokenID.String())
-	e.log.Debug().Str("token_id", tokenID.String()).Bool("neg_risk", negRisk).Msg("neg_risk resolved")
+	feeRateBPS := e.resolveFeeRate(ctx, tokenID.String())
+	e.log.Debug().Str("token_id", tokenID.String()).Bool("neg_risk", negRisk).Int("fee_rate_bps", feeRateBPS).Msg("market params resolved")
 
 	// EIP-712 sign the order.
 	var sigHex string
@@ -706,6 +734,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 			MakerAmount: makerAmount,
 			TakerAmount: takerAmount,
 			Side:        big.NewInt(int64(sideInt)),
+			FeeRateBPS:  feeRateBPS,
 			NegRisk:     negRisk,
 		})
 		if err != nil {
@@ -724,7 +753,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 			"takerAmount":   takerAmount.String(),
 			"expiration":    "0",
 			"nonce":         "0",
-			"feeRateBps":    strconv.Itoa(e.cfg.FeeRateBPS),
+			"feeRateBps":    strconv.Itoa(feeRateBPS),
 			"side":          sideStr,
 			"signatureType": 2, // GNOSIS_SAFE
 			"signature":     sigHex,
@@ -849,6 +878,7 @@ type orderSignInput struct {
 	MakerAmount *big.Int
 	TakerAmount *big.Int
 	Side        *big.Int // 0 = BUY, 1 = SELL
+	FeeRateBPS  int
 	NegRisk     bool
 }
 
@@ -906,7 +936,7 @@ func (e *LiveExecutor) signOrder(o orderSignInput) (string, error) {
 			"takerAmount":   o.TakerAmount,
 			"expiration":    zero,
 			"nonce":         zero,
-			"feeRateBps":    big.NewInt(int64(e.cfg.FeeRateBPS)),
+			"feeRateBps":    big.NewInt(int64(o.FeeRateBPS)),
 			"side":          o.Side,
 			"signatureType": big.NewInt(2), // GNOSIS_SAFE
 		},
