@@ -672,6 +672,12 @@ type clobOrderResponse struct {
 }
 
 func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir strategy.Direction, price, size decimal.Decimal) (string, error) {
+	// Polymarket enforces a 0.01 minimum tick size on price.
+	price = price.Round(2)
+	if price.IsZero() {
+		price = decimal.NewFromFloat(0.01)
+	}
+
 	sideInt := 0 // BUY YES tokens
 	sideStr := "BUY"
 	if dir == strategy.BuyNo {
