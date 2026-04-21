@@ -51,3 +51,7 @@ order = client.create_order(OrderArgs(
 body = order_to_json(order, client.creds.api_key, OrderType.GTC, False)
 print("\nPayload that py_clob_client would send:")
 print(json.dumps(body, indent=2))
+
+print("\nPosting order...")
+result = client.post_order(order, OrderType.GTC)
+print("Result:", result)
