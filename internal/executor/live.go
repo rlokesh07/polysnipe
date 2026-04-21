@@ -8,6 +8,7 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -713,12 +714,16 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 		e.log.Warn().Str("market", marketID).Msg("YES token ID not in market state; falling back to marketID as tokenId — order may be rejected")
 	}
 
-	// Random salt makes each order unique (required by CTF Exchange).
-	saltBytes := make([]byte, 32)
-	if _, err := crand.Read(saltBytes); err != nil {
+	// Salt must fit in a JSON float64 (< 2^53) so the CLOB's JSON parser
+	// doesn't lose precision before verifying the EIP-712 signature.
+	var saltInt64 int64
+	if err := binary.Read(crand.Reader, binary.BigEndian, &saltInt64); err != nil {
 		return "", fmt.Errorf("generate salt: %w", err)
 	}
-	salt := new(big.Int).SetBytes(saltBytes)
+	if saltInt64 < 0 {
+		saltInt64 = -saltInt64
+	}
+	salt := new(big.Int).SetInt64(saltInt64 % (1 << 53))
 
 	negRisk := e.resolveNegRisk(ctx, tokenID.String())
 	feeRateBPS := e.resolveFeeRate(ctx, tokenID.String())
