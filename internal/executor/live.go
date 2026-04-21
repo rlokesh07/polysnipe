@@ -694,6 +694,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	salt := new(big.Int).SetBytes(saltBytes)
 
 	negRisk := e.resolveNegRisk(ctx, tokenID.String())
+	e.log.Debug().Str("token_id", tokenID.String()).Bool("neg_risk", negRisk).Msg("neg_risk resolved")
 
 	// EIP-712 sign the order.
 	var sigHex string
