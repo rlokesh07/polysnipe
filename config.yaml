@@ -19,7 +19,7 @@ connection:
 
 # --- Dry Run (paper trading) ---
 # When true, uses a simulated executor: real market data, no real orders.
-dry_run: true
+dry_run: false
 dry_run_balance: 20.0
 
 # --- Market Discovery ---

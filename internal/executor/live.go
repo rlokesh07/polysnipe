@@ -152,7 +152,11 @@ func (e *LiveExecutor) fetchBalance(ctx context.Context) (decimal.Decimal, error
 	if err := json.Unmarshal(body, &result); err != nil {
 		return decimal.Zero, fmt.Errorf("parse balance: %w", err)
 	}
-	return decimal.NewFromString(result.Balance)
+	raw, err := decimal.NewFromString(result.Balance)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	return raw.Div(decimal.NewFromInt(1_000_000)), nil
 }
 
 // clobOpenOrder represents an open order from the CLOB.
