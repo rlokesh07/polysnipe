@@ -44,6 +44,7 @@ type LiveExecutor struct {
 	funderAddress  string            // Gnosis Safe proxy from config — order maker + balance owner
 	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool)
 	isNegRisk      func(marketID string) bool
+	negRiskCache   sync.Map // tokenID string → bool
 
 	mu          sync.Mutex
 	balance     decimal.Decimal
@@ -160,6 +161,32 @@ func (e *LiveExecutor) fetchBalance(ctx context.Context) (decimal.Decimal, error
 		return decimal.Zero, err
 	}
 	return raw.Div(decimal.NewFromInt(1_000_000)), nil
+}
+
+// resolveNegRisk returns whether a token ID is a neg-risk market, querying the CLOB if not cached.
+func (e *LiveExecutor) resolveNegRisk(ctx context.Context, tokenID string) bool {
+	if v, ok := e.negRiskCache.Load(tokenID); ok {
+		return v.(bool)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		e.connCfg.RESTBaseURL+"/neg-risk?token_id="+tokenID, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		NegRisk bool `json:"neg_risk"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return false
+	}
+	e.negRiskCache.Store(tokenID, result.NegRisk)
+	return result.NegRisk
 }
 
 // clobOpenOrder represents an open order from the CLOB.
@@ -666,7 +693,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	}
 	salt := new(big.Int).SetBytes(saltBytes)
 
-	negRisk := e.isNegRisk != nil && e.isNegRisk(marketID)
+	negRisk := e.resolveNegRisk(ctx, tokenID.String())
 
 	// EIP-712 sign the order.
 	var sigHex string
@@ -687,7 +714,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 
 	payload := map[string]interface{}{
 		"order": map[string]interface{}{
-			"salt":          salt.String(),
+			"salt":          json.RawMessage(salt.String()),
 			"maker":         e.funderAddress,
 			"signer":        e.walletAddress,
 			"taker":         "0x0000000000000000000000000000000000000000",
