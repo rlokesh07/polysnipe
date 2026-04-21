@@ -110,6 +110,12 @@ func (sf *SharedFeed) connect(ctx context.Context) error {
 	}
 	defer conn.Close()
 
+	// connCtx is cancelled when this connection dies, stopping all goroutines
+	// tied to it and preventing stale goroutines from stealing cmdCh messages
+	// on the next reconnect.
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
 	sf.log.Info().Msg("shared WebSocket connected")
 
 	// Re-subscribe all currently active markets after reconnect with one message.
@@ -147,7 +153,7 @@ func (sf *SharedFeed) connect(ctx context.Context) error {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-connCtx.Done():
 				return
 			case <-ticker.C:
 				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -160,10 +166,12 @@ func (sf *SharedFeed) connect(ctx context.Context) error {
 	}()
 
 	// Handle subscription commands in a separate goroutine.
+	// Uses connCtx so this goroutine exits when the connection dies,
+	// preventing it from stealing cmdCh messages meant for the next connection.
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-connCtx.Done():
 				return
 			case cmd, ok := <-sf.cmdCh:
 				if !ok {
