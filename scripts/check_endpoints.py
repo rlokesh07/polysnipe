@@ -9,7 +9,7 @@ except ImportError:
     print("ERROR: run 'pip install py-clob-client' first")
     sys.exit(1)
 
-for var in ["POLYMARKET_WALLET_KEY", "POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_PASSPHRASE"]:
+for var in ["POLYMARKET_WALLET_KEY", "POLYMARKET_FUNDER_ADDRESS", "POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_PASSPHRASE"]:
     if not os.environ.get(var):
         print(f"ERROR: {var} not set")
         sys.exit(1)
@@ -23,7 +23,8 @@ client = ClobClient(
         api_secret=os.environ["POLYMARKET_API_SECRET"],
         api_passphrase=os.environ["POLYMARKET_PASSPHRASE"],
     ),
-    signature_type=0,
+    signature_type=2,
+    funder=os.environ["POLYMARKET_FUNDER_ADDRESS"],
 )
 
 print("=== GET /balance-allowance?asset_type=COLLATERAL ===")
