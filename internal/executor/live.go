@@ -847,7 +847,7 @@ func (e *LiveExecutor) cancelOrder(ctx context.Context, orderID string) error {
 }
 
 func (e *LiveExecutor) checkOrderStatus(ctx context.Context, orderID string) (decimal.Decimal, OrderState, error) {
-	path := "/order/" + orderID
+	path := "/data/order/" + orderID
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.connCfg.RESTBaseURL+path, nil)
 	if err != nil {
 		return decimal.Zero, OrderPending, err
