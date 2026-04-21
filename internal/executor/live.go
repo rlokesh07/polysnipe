@@ -130,7 +130,7 @@ func (e *LiveExecutor) Balance() decimal.Decimal {
 func (e *LiveExecutor) fetchBalance(ctx context.Context) (decimal.Decimal, error) {
 	const balPath = "/balance-allowance"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		e.connCfg.RESTBaseURL+balPath+"?asset_type=COLLATERAL", nil)
+		e.connCfg.RESTBaseURL+balPath+"?asset_type=COLLATERAL&signature_type=2", nil)
 	if err != nil {
 		return decimal.Zero, err
 	}
