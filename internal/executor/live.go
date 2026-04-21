@@ -615,8 +615,10 @@ type clobOrderResponse struct {
 
 func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir strategy.Direction, price, size decimal.Decimal) (string, error) {
 	sideInt := 0 // BUY YES tokens
+	sideStr := "BUY"
 	if dir == strategy.BuyNo {
 		sideInt = 1 // SELL YES tokens (= buy NO)
+		sideStr = "SELL"
 	}
 
 	// Scale USDC amounts to 6-decimal integer representation (Polygon USDC).
@@ -689,7 +691,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 			"expiration":    "0",
 			"nonce":         "0",
 			"feeRateBps":    strconv.Itoa(e.cfg.FeeRateBPS),
-			"side":          sideInt,
+			"side":          sideStr,
 			"signatureType": 2, // GNOSIS_SAFE
 			"signature":     sigHex,
 		},
