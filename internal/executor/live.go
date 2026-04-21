@@ -701,6 +701,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 
 	body, _ := json.Marshal(payload)
 	bodyStr := string(body)
+	e.log.Debug().Str("payload", bodyStr).Msg("submitting order")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.connCfg.RESTBaseURL+"/order", bytes.NewReader(body))
 	if err != nil {
 		return "", err
