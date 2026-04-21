@@ -685,20 +685,25 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 		sideStr = "SELL"
 	}
 
-	// Scale USDC amounts to 6-decimal integer representation (Polygon USDC).
-	// tokenId must be the YES token's uint256 ID from the CTF contract.
-	// ⚠️ sig.MarketID should be the YES token ID (decimal string), not the condition ID.
-	scale := decimal.NewFromInt(1_000_000)
-	var makerAmt, takerAmt decimal.Decimal
-	if sideInt == 0 { // BUY: spend USDC (makerAmount), receive YES tokens (takerAmount)
-		makerAmt = size.Mul(scale)
-		takerAmt = size.Div(price).Mul(scale)
-	} else { // SELL: spend YES tokens (makerAmount), receive USDC (takerAmount)
-		makerAmt = size.Div(price).Mul(scale)
-		takerAmt = size.Mul(scale)
+	// Compute amounts so that makerAmount/takerAmount is exactly price (a 0.01-tick multiple).
+	// Express price as k/100 cents, then: N = round(size*1e6 / k), and use N*k / N*100.
+	hundred := decimal.NewFromInt(100)
+	priceCents := price.Mul(hundred).Round(0) // k
+	if priceCents.IsZero() {
+		priceCents = decimal.NewFromInt(1)
 	}
-	makerAmount := makerAmt.BigInt()
-	takerAmount := takerAmt.BigInt()
+	n := size.Mul(decimal.NewFromInt(1_000_000)).Div(priceCents).Round(0)
+	if n.IsZero() {
+		n = decimal.NewFromInt(1)
+	}
+	var makerAmount, takerAmount *big.Int
+	if sideInt == 0 { // BUY: spend USDC (makerAmount=N*k), receive YES tokens (takerAmount=N*100)
+		makerAmount = n.Mul(priceCents).BigInt()
+		takerAmount = n.Mul(hundred).BigInt()
+	} else { // SELL: spend YES tokens (makerAmount=N*100), receive USDC (takerAmount=N*k)
+		makerAmount = n.Mul(hundred).BigInt()
+		takerAmount = n.Mul(priceCents).BigInt()
+	}
 
 	// Resolve YES token ID from the market state store (set by discovery engine).
 	// Both BUY and SELL orders use the YES token ID; direction is indicated by the side field.
