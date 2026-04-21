@@ -685,24 +685,29 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 		sideStr = "SELL"
 	}
 
-	// Compute amounts so that makerAmount/takerAmount is exactly price (a 0.01-tick multiple).
-	// Express price as k/100 cents, then: N = round(size*1e6 / k), and use N*k / N*100.
+	// CLOB precision rules:
+	//   token amounts must be multiples of 10000 (2 decimal places at 1e6 scale)
+	//   USDC amounts must be multiples of 100   (4 decimal places at 1e6 scale)
+	// Use q = round(size*100) 0.01-token units so both constraints are satisfied
+	// and makerAmount/takerAmount == price exactly.
 	hundred := decimal.NewFromInt(100)
-	priceCents := price.Mul(hundred).Round(0) // k
+	priceCents := price.Mul(hundred).Round(0) // k = price in whole cents
 	if priceCents.IsZero() {
 		priceCents = decimal.NewFromInt(1)
 	}
-	n := size.Mul(decimal.NewFromInt(1_000_000)).Div(priceCents).Round(0)
-	if n.IsZero() {
-		n = decimal.NewFromInt(1)
+	q := size.Mul(hundred).Round(0) // number of 0.01-token units
+	if q.IsZero() {
+		q = decimal.NewFromInt(1)
 	}
+	tokenAmt := q.Mul(decimal.NewFromInt(10_000))  // multiple of 10000
+	usdcAmt := q.Mul(priceCents).Mul(hundred)      // multiple of 100
 	var makerAmount, takerAmount *big.Int
-	if sideInt == 0 { // BUY: spend USDC (makerAmount=N*k), receive YES tokens (takerAmount=N*100)
-		makerAmount = n.Mul(priceCents).BigInt()
-		takerAmount = n.Mul(hundred).BigInt()
-	} else { // SELL: spend YES tokens (makerAmount=N*100), receive USDC (takerAmount=N*k)
-		makerAmount = n.Mul(hundred).BigInt()
-		takerAmount = n.Mul(priceCents).BigInt()
+	if sideInt == 0 { // BUY: spend USDC (makerAmount), receive tokens (takerAmount)
+		makerAmount = usdcAmt.BigInt()
+		takerAmount = tokenAmt.BigInt()
+	} else { // SELL: spend tokens (makerAmount), receive USDC (takerAmount)
+		makerAmount = tokenAmt.BigInt()
+		takerAmount = usdcAmt.BigInt()
 	}
 
 	// Resolve YES token ID from the market state store (set by discovery engine).
