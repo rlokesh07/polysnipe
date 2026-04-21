@@ -49,7 +49,17 @@ eip712_hash = "0x" + hash_bytes.hex()
 print(f"EIP-712 hash: {eip712_hash}")
 print(f"Exchange:     {cfg.exchange}")
 
-recovered = Account.recoverHash(hash_bytes, signature=SIGNATURE)
+from eth_account.messages import encode_defunct
+# recoverHash was removed; use _recover_hash from internals or sign manually
+sig_bytes = bytes.fromhex(SIGNATURE.removeprefix("0x"))
+r = int.from_bytes(sig_bytes[0:32], "big")
+s = int.from_bytes(sig_bytes[32:64], "big")
+v = sig_bytes[64]
+from eth_keys import keys
+from eth_keys.backends import NativeECCBackend
+sig_obj = keys.Signature(vrs=(v - 27, r, s))
+pub = sig_obj.recover_public_key_from_msg_hash(hash_bytes)
+recovered = pub.to_checksum_address()
 print(f"Recovered:    {recovered}")
 print(f"Expected:     {SIGNER_ADDR}")
 print(f"Valid:        {recovered.lower() == SIGNER_ADDR.lower()}")
