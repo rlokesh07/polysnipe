@@ -18,6 +18,7 @@ type GammaMarket struct {
 	Liquidity     float64   `json:"liquidityClob"`
 	Active        bool      `json:"active"`
 	Closed        bool      `json:"closed"`
+	NegRisk       bool      `json:"neg_risk"`
 	EndDateStr    string    `json:"endDate"`
 	EndDate       time.Time `json:"-"`
 	EventID       string    `json:"eventId"`
@@ -44,6 +45,7 @@ type gammaMarketWire struct {
 	Liquidity        float64 `json:"liquidityClob"`
 	Active           bool    `json:"active"`
 	Closed           bool    `json:"closed"`
+	NegRisk          bool    `json:"neg_risk"`
 	EndDateStr       string  `json:"endDate"`
 	EventID          string  `json:"eventId"`
 }
@@ -63,6 +65,7 @@ func (m *GammaMarket) UnmarshalJSON(data []byte) error {
 	m.Liquidity = w.Liquidity
 	m.Active = w.Active
 	m.Closed = w.Closed
+	m.NegRisk = w.NegRisk
 	m.EndDateStr = w.EndDateStr
 	m.EventID = w.EventID
 

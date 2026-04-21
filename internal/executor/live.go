@@ -43,6 +43,7 @@ type LiveExecutor struct {
 	walletAddress  string            // EOA address derived from privateKey — order signer
 	funderAddress  string            // Gnosis Safe proxy from config — order maker + balance owner
 	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool)
+	isNegRisk      func(marketID string) bool
 
 	mu          sync.Mutex
 	balance     decimal.Decimal
@@ -57,6 +58,7 @@ func NewLiveExecutor(
 	sizer sizing.Sizer,
 	balance decimal.Decimal,
 	getMarketState func(marketID string) (bid, ask decimal.Decimal, tokenIDYes string, ok bool),
+	isNegRisk func(marketID string) bool,
 	log zerolog.Logger,
 ) (*LiveExecutor, error) {
 	var privKey *ecdsa.PrivateKey
@@ -92,6 +94,7 @@ func NewLiveExecutor(
 		funderAddress:  connCfg.FunderAddress,
 		balance:        balance,
 		getMarketState: getMarketState,
+		isNegRisk:      isNegRisk,
 	}, nil
 }
 
@@ -663,6 +666,8 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	}
 	salt := new(big.Int).SetBytes(saltBytes)
 
+	negRisk := e.isNegRisk != nil && e.isNegRisk(marketID)
+
 	// EIP-712 sign the order.
 	var sigHex string
 	if e.privateKey != nil {
@@ -673,6 +678,7 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 			MakerAmount: makerAmount,
 			TakerAmount: takerAmount,
 			Side:        big.NewInt(int64(sideInt)),
+			NegRisk:     negRisk,
 		})
 		if err != nil {
 			e.log.Warn().Err(err).Msg("EIP-712 order signing failed; order will be rejected")
@@ -815,6 +821,7 @@ type orderSignInput struct {
 	MakerAmount *big.Int
 	TakerAmount *big.Int
 	Side        *big.Int // 0 = BUY, 1 = SELL
+	NegRisk     bool
 }
 
 // signOrder computes the EIP-712 signature for a Polymarket CTF Exchange order.
@@ -851,10 +858,15 @@ func (e *LiveExecutor) signOrder(o orderSignInput) (string, error) {
 		},
 		PrimaryType: "Order",
 		Domain: apitypes.TypedDataDomain{
-			Name:              "Polymarket CTF Exchange",
-			Version:           "1",
-			ChainId:           gmath.NewHexOrDecimal256(137),
-			VerifyingContract: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+			Name:    "Polymarket CTF Exchange",
+			Version: "1",
+			ChainId: gmath.NewHexOrDecimal256(137),
+			VerifyingContract: func() string {
+				if o.NegRisk {
+					return "0xC5d563A36AE78145C45a50134d48A1215220f80a" // neg_risk exchange
+				}
+				return "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E" // standard exchange
+			}(),
 		},
 		Message: apitypes.TypedDataMessage{
 			"salt":          o.Salt,

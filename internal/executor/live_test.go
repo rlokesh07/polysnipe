@@ -24,6 +24,7 @@ func newTestExecutor(t *testing.T, serverURL string) *LiveExecutor {
 		nil,  // sizer   — not used by HTTP methods
 		decimal.NewFromFloat(100),
 		nil, // getMarketState — set per-test when needed
+		nil, // isNegRisk — not used by HTTP methods
 		zerolog.Nop(),
 	)
 	if err != nil {
@@ -395,6 +396,7 @@ func TestResolveOrderPrice(t *testing.T) {
 					ask := decimal.NewFromFloat(tt.ask)
 					return bid, ask, "", bid.IsPositive() && ask.IsPositive()
 				},
+				nil, // isNegRisk
 				zerolog.Nop(),
 			)
 			if err != nil {

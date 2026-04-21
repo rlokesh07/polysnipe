@@ -18,6 +18,7 @@ type MarketInfo struct {
 	Question    string
 	Tags        []string
 	EndDate     string // RFC3339
+	NegRisk     bool
 }
 
 // MarketCommand is sent from the discovery engine to the orchestrator.
@@ -67,5 +68,6 @@ func marketInfoFromGamma(gm gamma.GammaMarket) MarketInfo {
 		Question:    gm.Question,
 		Tags:        tags,
 		EndDate:     gm.EndDateStr,
+		NegRisk:     gm.NegRisk,
 	}
 }
