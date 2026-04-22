@@ -372,12 +372,6 @@ func (e *LiveExecutor) handleSignal(ctx context.Context, sig strategy.Signal) er
 
 	size := e.sizer.Size(balance, sig.StrategyID)
 
-	// Skip if balance can't cover even the minimum order size the sizer returned.
-	if size.GreaterThan(balance) {
-		return fmt.Errorf("insufficient balance %.6f USDC (need %.6f); skipping",
-			balance.InexactFloat64(), size.InexactFloat64())
-	}
-
 	if err := e.risk.Check(sig, sig.StrategyID, size); err != nil {
 		return fmt.Errorf("risk check failed: %w", err)
 	}
@@ -405,6 +399,16 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 		limitPrice = midPrice.Add(midPrice.Mul(offsetBPS))
 	} else {
 		limitPrice = midPrice.Sub(midPrice.Mul(offsetBPS))
+	}
+
+	// Cost in USDC = price_per_contract × contracts.
+	cost := limitPrice.Mul(size)
+	e.mu.Lock()
+	balance := e.balance
+	e.mu.Unlock()
+	if cost.GreaterThan(balance) {
+		return fmt.Errorf("insufficient balance %.4f USDC (order costs %.4f); skipping",
+			balance.InexactFloat64(), cost.InexactFloat64())
 	}
 
 	orderID, err := e.submitOrder(ctx, sig.MarketID, sig.Direction, limitPrice, size)
