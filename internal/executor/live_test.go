@@ -422,7 +422,7 @@ func TestResolveOrderPrice(t *testing.T) {
 				t.Fatalf("NewLiveExecutor: %v", err)
 			}
 
-			price, err := e.resolveOrderPrice("mkt-x", decimal.NewFromFloat(tt.sigPrice))
+			price, err := e.resolveOrderPrice("mkt-x", decimal.NewFromFloat(tt.sigPrice), true)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")

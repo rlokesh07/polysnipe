@@ -32,7 +32,8 @@ type SMAReversion struct {
 type smaMarketState struct {
 	prices       []decimal.Decimal // rolling price window, len <= smaPeriod
 	hasPos       bool              // true only after entry order is confirmed filled
-	pendingEntry bool              // true after signal sent, before fill/cancel feedback
+	pendingEntry bool              // true after entry signal sent, before fill/cancel feedback
+	pendingClose bool              // true after close signal sent, before StatusClosed feedback
 	posDir       Direction
 	entryYesMid  decimal.Decimal // YES mid at entry, used for stop-loss
 	aboveSMA     *bool           // which side of SMA price was on last tick (nil = unknown)
@@ -114,9 +115,15 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 			if ms, exists := s.states[update.MarketID]; exists {
 				switch update.Status {
 				case StatusOpen:
-					// Entry order confirmed filled — position is now live.
-					ms.hasPos = true
-					ms.pendingEntry = false
+					if ms.pendingClose {
+						// Executor couldn't close (e.g. spread too wide) — position still live.
+						ms.pendingClose = false
+						ms.hasPos = true
+					} else {
+						// Entry order confirmed filled — position is now live.
+						ms.hasPos = true
+						ms.pendingEntry = false
+					}
 				case StatusNone:
 					// Entry order rejected — just clear the pending flag so we can retry.
 					// Keep the price window and aboveSMA so SMA context is preserved.
@@ -124,6 +131,7 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 				case StatusClosed:
 					ms.hasPos = false
 					ms.pendingEntry = false
+					ms.pendingClose = false
 					ms.prices = ms.prices[:0]
 					ms.aboveSMA = nil
 				}
@@ -167,9 +175,7 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 							Str("mid", mid.String()).
 							Str("side", ms.posDir.String()).
 							Msg("market resolving; closing position")
-						ms.hasPos = false
-						ms.prices = ms.prices[:0]
-						ms.aboveSMA = nil
+						ms.pendingClose = true
 					case <-ctx.Done():
 						return
 					}
@@ -192,7 +198,7 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 
 			// While an entry order is pending (submitted but not yet filled/rejected),
 			// skip all entry and exit logic. The position isn't live yet.
-			if ms.pendingEntry {
+			if ms.pendingEntry || ms.pendingClose {
 				continue
 			}
 
@@ -231,9 +237,7 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 							Str("entry", ms.entryYesMid.String()).
 							Str("mid", mid.String()).
 							Msg("closing position")
-						ms.hasPos = false
-						ms.prices = ms.prices[:0]
-						ms.aboveSMA = nil
+						ms.pendingClose = true
 					case <-ctx.Done():
 						return
 					}

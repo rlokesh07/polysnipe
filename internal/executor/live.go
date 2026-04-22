@@ -102,13 +102,13 @@ func NewLiveExecutor(
 }
 
 // resolveOrderPrice returns the mid-price to use for a limit order.
-// It checks the real-time spread and returns an error if it exceeds MaxOrderSpreadCents.
+// When checkSpread is true, returns an error if the spread exceeds MaxOrderSpreadCents.
 // Falls back to sig.Price, then 0.5 with a warning.
-func (e *LiveExecutor) resolveOrderPrice(marketID string, sigPrice decimal.Decimal) (decimal.Decimal, error) {
+func (e *LiveExecutor) resolveOrderPrice(marketID string, sigPrice decimal.Decimal, checkSpread bool) (decimal.Decimal, error) {
 	if e.getMarketState != nil {
 		bid, ask, _, _, ok := e.getMarketState(marketID)
 		if ok && bid.IsPositive() && ask.IsPositive() {
-			if e.cfg.MaxOrderSpreadCents > 0 {
+			if checkSpread && e.cfg.MaxOrderSpreadCents > 0 {
 				spread, _ := ask.Sub(bid).Mul(decimal.NewFromInt(100)).Float64()
 				if spread > e.cfg.MaxOrderSpreadCents {
 					return decimal.Zero, fmt.Errorf("spread %.2f¢ > max %.2f¢ for %s; skipping",
@@ -339,7 +339,23 @@ func (e *LiveExecutor) handleSignal(ctx context.Context, sig strategy.Signal) er
 		if err := e.ledger.ValidateClose(sig.StrategyID, sig.MarketID); err != nil {
 			return err
 		}
-		return e.placeCloseOrder(ctx, sig)
+		if err := e.placeCloseOrder(ctx, sig); err != nil {
+			// Close attempt failed (e.g. spread too wide, transient error).
+			// Tell the strategy the position is still open so it can retry.
+			update := strategy.PositionUpdate{
+				StrategyID: sig.StrategyID,
+				MarketID:   sig.MarketID,
+				Status:     strategy.StatusOpen,
+			}
+			if pos := e.ledger.GetPosition(sig.StrategyID, sig.MarketID); pos != nil {
+				update.Side = pos.Side
+				update.EntryPrice = pos.EntryPrice
+				update.Size = pos.Size
+			}
+			e.sendFeedback(sig.StrategyID, update)
+			return err
+		}
+		return nil
 	}
 
 	// Entry signal — check for existing position.
@@ -365,7 +381,7 @@ func (e *LiveExecutor) handleSignal(ctx context.Context, sig strategy.Signal) er
 }
 
 func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal, size decimal.Decimal) error {
-	midPrice, err := e.resolveOrderPrice(sig.MarketID, sig.Price)
+	midPrice, err := e.resolveOrderPrice(sig.MarketID, sig.Price, true)
 	if err != nil {
 		return err
 	}
@@ -430,7 +446,7 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		closeDir = strategy.SellNo
 	}
 
-	midPrice, err := e.resolveOrderPrice(sig.MarketID, sig.Price)
+	midPrice, err := e.resolveOrderPrice(sig.MarketID, sig.Price, false)
 	if err != nil {
 		return err
 	}
