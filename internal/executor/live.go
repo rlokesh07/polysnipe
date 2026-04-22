@@ -852,7 +852,9 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 			Code  string `json:"error_code"`
 		}
 		_ = json.Unmarshal(respBody, &clobErr)
-		if clobErr.Code == "insufficient_balance" {
+		isBalanceError := clobErr.Code == "insufficient_balance" ||
+			strings.Contains(strings.ToLower(clobErr.Error), "not enough balance")
+		if isBalanceError {
 			if bal, ferr := e.fetchBalance(context.Background()); ferr == nil {
 				e.mu.Lock()
 				e.balance = bal

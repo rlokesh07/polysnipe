@@ -232,8 +232,8 @@ func TestSubmitOrder_InsufficientBalance_RefreshesBalance(t *testing.T) {
 		case "/order":
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{
-				"error":      "insufficient balance",
-				"error_code": "insufficient_balance",
+				"error":      "not enough balance / allowance: balance: 1597034, order amount: 1600000",
+				"error_code": "",
 			})
 		case "/balance-allowance":
 			balanceFetched = true

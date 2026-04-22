@@ -117,7 +117,11 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 					// Entry order confirmed filled — position is now live.
 					ms.hasPos = true
 					ms.pendingEntry = false
-				case StatusClosed, StatusNone:
+				case StatusNone:
+					// Entry order rejected — just clear the pending flag so we can retry.
+					// Keep the price window and aboveSMA so SMA context is preserved.
+					ms.pendingEntry = false
+				case StatusClosed:
 					ms.hasPos = false
 					ms.pendingEntry = false
 					ms.prices = ms.prices[:0]
