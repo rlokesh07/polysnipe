@@ -140,13 +140,24 @@ func (ms *MarketStack) getPriceHistory() []float64 {
 	return out
 }
 
+// subscriptionGracePeriod is subtracted from SubscribedAt when computing stale age
+// before the first tick arrives. This accounts for WebSocket subscription latency —
+// the stale clock doesn't really start until the subscription has had a chance to
+// propagate to Polymarket's servers and stream back the first event.
+const subscriptionGracePeriod = 30 * time.Second
+
 // timeSinceLastTick returns how long ago the last price update was received.
-// If no tick has arrived yet, it measures from SubscribedAt.
+// Before the first tick it measures from SubscribedAt, minus a grace period so
+// that newly-subscribed markets aren't reaped before ticks can arrive.
 func (ms *MarketStack) timeSinceLastTick() time.Duration {
 	ms.priceMu.Lock()
 	defer ms.priceMu.Unlock()
 	if ms.lastTick.IsZero() {
-		return time.Since(ms.SubscribedAt)
+		elapsed := time.Since(ms.SubscribedAt)
+		if elapsed < subscriptionGracePeriod {
+			return 0
+		}
+		return elapsed - subscriptionGracePeriod
 	}
 	return time.Since(ms.lastTick)
 }
@@ -389,6 +400,15 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 		orch.registry[mktID] = stack
 		orch.questions[mktID] = cmd.Market.Question
 		orch.registryMu.Unlock()
+
+		// Pre-populate token IDs immediately so the executor can sign orders even
+		// before the first bid/ask tick arrives. The price goroutine will overwrite
+		// this entry with live prices once ticks start streaming.
+		marketStates.Store(mktID, marketStateEntry{
+			tokenIDYes: cmd.Market.TokenIDYes,
+			tokenIDNo:  cmd.Market.TokenIDNo,
+			negRisk:    cmd.Market.NegRisk,
+		})
 
 		// Rough window end — strategies update internally; this just seeds the engine.
 		windowEnd := time.Now().Add(24 * time.Hour)
@@ -667,6 +687,10 @@ func runLive(cfg *config.Config, logger zerolog.Logger) {
 					atCap := cfg.Discovery.MaxMarkets > 0 && len(orch.registry) >= cfg.Discovery.MaxMarkets
 					orch.registryMu.RUnlock()
 					if !already && !atCap {
+						logger.Debug().
+							Str("market_id", cmd.Market.ConditionID).
+							Strs("strategies", cmd.Strategies).
+							Msg("orchestrator: processing subscribe command")
 						subscribeMarket(cmd)
 					} else if !already && atCap {
 						logger.Debug().

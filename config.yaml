@@ -31,8 +31,8 @@ discovery:
   max_markets: 20                             # cap on simultaneous WebSocket subscriptions (0 = unlimited)
   max_spread_cents: 5                         # drop market if bid-ask spread > N cents on first tick (0 = disabled)
   updown_max_spread_cents: 5                 # spread threshold override for up-or-down markets (0 = use max_spread_cents)
-  stale_market_timeout_sec: 15               # drop market if no price tick received within this window (0 = disabled)
-  updown_stale_timeout_sec: 60              # stale timeout for up-or-down markets (longer grace period; 0 = use default)
+  stale_market_timeout_sec: 120              # drop market if no price tick received within this window (0 = disabled)
+  updown_stale_timeout_sec: 300             # stale timeout for up-or-down markets (longer grace period; 0 = use default)
   updown_markets:
     enabled: true
     assets: ["btc", "eth", "sol", "xrp"]    # generates 15m and 1h slug candidates each poll cycle

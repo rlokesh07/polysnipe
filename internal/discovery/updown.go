@@ -79,7 +79,7 @@ func (d *upDownDiscovery) poll(ctx context.Context) []gamma.GammaMarket {
 		if mkt.Closed || !mkt.Active {
 			continue
 		}
-		if time.Until(mkt.EndDate) <= 0 {
+		if time.Until(mkt.EndDate) < 2*time.Minute {
 			continue
 		}
 

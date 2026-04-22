@@ -409,18 +409,11 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 	}
 
 	e.risk.RecordOpen(sig.StrategyID, sig.MarketID, size)
-	e.sendFeedback(sig.StrategyID, strategy.PositionUpdate{
-		StrategyID:  sig.StrategyID,
-		MarketID:    sig.MarketID,
-		Status:      strategy.StatusOpen,
-		Side:        sig.Direction,
-		EntryPrice:  limitPrice,
-		Size:        size,
-		OpenOrderID: orderID,
-		OrderState:  strategy.OrderPending,
-	})
 
-	// Monitor the order asynchronously.
+	// Do NOT send StatusOpen feedback here — the order is merely pending on the CLOB,
+	// not filled. monitorOrder will send StatusOpen once the order actually fills,
+	// or StatusNone/StatusClosed if it times out or is cancelled. Sending StatusOpen
+	// on submit was the root cause of 500+ phantom-position errors.
 	go e.monitorOrder(ctx, order)
 	return nil
 }
@@ -446,6 +439,25 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 	closePrice := midPrice.Sub(midPrice.Mul(offsetBPS))
 	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, pos.Size)
 	if err != nil {
+		// "orderbook does not exist" means the market has already resolved.
+		// Force-close the position so the strategy stops retrying.
+		if strings.Contains(err.Error(), "orderbook") {
+			e.ledger.ClosePosition(sig.StrategyID, sig.MarketID)
+			e.risk.RecordClose(sig.StrategyID, sig.MarketID, pos.Size, decimal.Zero)
+			e.sendFeedback(sig.StrategyID, strategy.PositionUpdate{
+				StrategyID: sig.StrategyID,
+				MarketID:   sig.MarketID,
+				Status:     strategy.StatusClosed,
+				Side:       pos.Side,
+				EntryPrice: pos.EntryPrice,
+				Size:       pos.Size,
+			})
+			e.log.Warn().
+				Str("market_id", sig.MarketID).
+				Str("strategy_id", sig.StrategyID).
+				Msg("market resolved; force-closing position without exit order")
+			return nil
+		}
 		return fmt.Errorf("submit close order: %w", err)
 	}
 
@@ -872,6 +884,9 @@ func (e *LiveExecutor) cancelOrder(ctx context.Context, orderID string) error {
 		return err
 	}
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // already expired or filled — treat as success
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("cancel order %s: status %d", orderID, resp.StatusCode)
 	}

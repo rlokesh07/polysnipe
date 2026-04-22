@@ -40,7 +40,8 @@ func TestFetchBalance_Success(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/balance-allowance" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
-		json.NewEncoder(w).Encode(map[string]string{"balance": "250.75"})
+		// API returns balance in micro-USDC (6 decimals); 250.75 USDC = 250750000
+		json.NewEncoder(w).Encode(map[string]string{"balance": "250750000"})
 	}))
 	defer srv.Close()
 
@@ -182,11 +183,17 @@ func TestReconcileOpenOrders_NoOrphans(t *testing.T) {
 
 func TestSubmitOrder_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/order" {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/order":
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(clobOrderResponse{OrderID: "new-order-99", Status: "PENDING"})
+		case r.Method == http.MethodGet && r.URL.Path == "/neg-risk":
+			json.NewEncoder(w).Encode(map[string]bool{"neg_risk": false})
+		case r.Method == http.MethodGet && r.URL.Path == "/fee-rate":
+			json.NewEncoder(w).Encode(map[string]int{"base_fee": 0})
+		default:
 			t.Errorf("unexpected: %s %s", r.Method, r.URL.Path)
 		}
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(clobOrderResponse{OrderID: "new-order-99", Status: "PENDING"})
 	}))
 	defer srv.Close()
 
@@ -262,13 +269,25 @@ func TestCancelOrder_Success(t *testing.T) {
 
 func TestCancelOrder_HTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not found", http.StatusNotFound)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	e := newTestExecutor(t, srv.URL)
 	if err := e.cancelOrder(context.Background(), "xyz"); err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestCancelOrder_NotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	e := newTestExecutor(t, srv.URL)
+	if err := e.cancelOrder(context.Background(), "already-gone"); err != nil {
+		t.Fatalf("404 should be treated as success, got error: %v", err)
 	}
 }
 

@@ -30,11 +30,12 @@ type SMAReversion struct {
 }
 
 type smaMarketState struct {
-	prices      []decimal.Decimal // rolling price window, len <= smaPeriod
-	hasPos      bool
-	posDir      Direction
-	entryYesMid decimal.Decimal // YES mid at entry, used for stop-loss
-	aboveSMA    *bool           // which side of SMA price was on last tick (nil = unknown)
+	prices       []decimal.Decimal // rolling price window, len <= smaPeriod
+	hasPos       bool              // true only after entry order is confirmed filled
+	pendingEntry bool              // true after signal sent, before fill/cancel feedback
+	posDir       Direction
+	entryYesMid  decimal.Decimal // YES mid at entry, used for stop-loss
+	aboveSMA     *bool           // which side of SMA price was on last tick (nil = unknown)
 }
 
 // NewSMAReversion creates a new SMAReversion strategy.
@@ -111,8 +112,14 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 				return
 			}
 			if ms, exists := s.states[update.MarketID]; exists {
-				if update.Status == StatusClosed || update.Status == StatusNone {
+				switch update.Status {
+				case StatusOpen:
+					// Entry order confirmed filled — position is now live.
+					ms.hasPos = true
+					ms.pendingEntry = false
+				case StatusClosed, StatusNone:
 					ms.hasPos = false
+					ms.pendingEntry = false
 					ms.prices = ms.prices[:0]
 					ms.aboveSMA = nil
 				}
@@ -178,6 +185,12 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 			}
 
 			sma := s.computeSMA(ms.prices)
+
+			// While an entry order is pending (submitted but not yet filled/rejected),
+			// skip all entry and exit logic. The position isn't live yet.
+			if ms.pendingEntry {
+				continue
+			}
 
 			// Exit logic.
 			if ms.hasPos {
@@ -261,7 +274,8 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 			}
 			select {
 			case signalCh <- sig:
-				ms.hasPos = true
+				// Mark pending — hasPos stays false until executor confirms fill.
+				ms.pendingEntry = true
 				ms.posDir = dir
 				ms.entryYesMid = mid
 			case <-ctx.Done():
