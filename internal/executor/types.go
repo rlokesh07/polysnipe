@@ -30,6 +30,7 @@ type Order struct {
 	StrategyID  string
 	MarketID    string
 	Side        strategy.Direction
+	IsClose     bool // true for exit/close orders, false for entry orders
 	Price       decimal.Decimal
 	Size        decimal.Decimal
 	FilledSize  decimal.Decimal

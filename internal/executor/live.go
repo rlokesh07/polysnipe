@@ -337,6 +337,13 @@ func (e *LiveExecutor) handleSignal(ctx context.Context, sig strategy.Signal) er
 
 	if sig.Direction == strategy.Close {
 		if err := e.ledger.ValidateClose(sig.StrategyID, sig.MarketID); err != nil {
+			// Ledger has no record of this position — strategy is out of sync.
+			// Send StatusClosed so the strategy resets and stops trying to close.
+			e.sendFeedback(sig.StrategyID, strategy.PositionUpdate{
+				StrategyID: sig.StrategyID,
+				MarketID:   sig.MarketID,
+				Status:     strategy.StatusClosed,
+			})
 			return err
 		}
 		if err := e.placeCloseOrder(ctx, sig); err != nil {
@@ -364,6 +371,13 @@ func (e *LiveExecutor) handleSignal(ctx context.Context, sig strategy.Signal) er
 	}
 
 	size := e.sizer.Size(balance, sig.StrategyID)
+
+	// Skip if balance can't cover even the minimum order size the sizer returned.
+	if size.GreaterThan(balance) {
+		return fmt.Errorf("insufficient balance %.6f USDC (need %.6f); skipping",
+			balance.InexactFloat64(), size.InexactFloat64())
+	}
+
 	if err := e.risk.Check(sig, sig.StrategyID, size); err != nil {
 		return fmt.Errorf("risk check failed: %w", err)
 	}
@@ -477,26 +491,14 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		return fmt.Errorf("submit close order: %w", err)
 	}
 
-	e.ledger.ClosePosition(sig.StrategyID, sig.MarketID)
-	e.risk.RecordClose(sig.StrategyID, sig.MarketID, pos.Size, decimal.Zero)
-
-	e.sendFeedback(sig.StrategyID, strategy.PositionUpdate{
-		StrategyID:  sig.StrategyID,
-		MarketID:    sig.MarketID,
-		Status:      strategy.StatusClosed,
-		Side:        pos.Side,
-		EntryPrice:  pos.EntryPrice,
-		Size:        pos.Size,
-		OpenOrderID: orderID,
-		OrderState:  strategy.OrderPending,
-	})
-
-	// Monitor the close order so it gets cancelled if it doesn't fill in time.
+	// Keep the position in the ledger until fill is confirmed.
+	// monitorOrder will close it on fill and send StatusClosed feedback.
 	closeOrder := Order{
 		ID:         orderID,
 		StrategyID: sig.StrategyID,
 		MarketID:   sig.MarketID,
 		Side:       closeDir,
+		IsClose:    true,
 		Price:      closePrice,
 		Size:       pos.Size,
 		State:      OrderPending,
@@ -526,15 +528,26 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 			if err := e.cancelOrder(ctx, order.ID); err != nil {
 				e.log.Error().Err(err).Str("order_id", order.ID).Msg("failed to cancel order")
 			}
-			e.ledger.ClosePosition(order.StrategyID, order.MarketID)
-			e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
-				StrategyID:  order.StrategyID,
-				MarketID:    order.MarketID,
-				Status:      strategy.StatusClosed,
-				Side:        order.Side,
-				OpenOrderID: order.ID,
-				OrderState:  strategy.OrderExpired,
-			})
+			if order.IsClose {
+				// Close order timed out without filling — position is still open.
+				e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+					StrategyID:  order.StrategyID,
+					MarketID:    order.MarketID,
+					Status:      strategy.StatusOpen,
+					OpenOrderID: order.ID,
+					OrderState:  strategy.OrderExpired,
+				})
+			} else {
+				e.ledger.ClosePosition(order.StrategyID, order.MarketID)
+				e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+					StrategyID:  order.StrategyID,
+					MarketID:    order.MarketID,
+					Status:      strategy.StatusClosed,
+					Side:        order.Side,
+					OpenOrderID: order.ID,
+					OrderState:  strategy.OrderExpired,
+				})
+			}
 			return
 		case <-ticker.C:
 			filled, state, err := e.checkOrderStatus(ctx, order.ID)
@@ -548,36 +561,69 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 
 			if state == OrderFilled {
 				e.log.Info().Str("order_id", order.ID).Msg("order filled")
-				cost := order.Price.Mul(order.FilledSize)
+				proceeds := order.Price.Mul(order.FilledSize)
 				e.mu.Lock()
-				e.balance = e.balance.Sub(cost)
+				if order.IsClose {
+					// Selling tokens: receive USDC back.
+					e.balance = e.balance.Add(proceeds)
+				} else {
+					// Buying tokens: spend USDC.
+					e.balance = e.balance.Sub(proceeds)
+				}
 				e.mu.Unlock()
-				e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
-					StrategyID:  order.StrategyID,
-					MarketID:    order.MarketID,
-					Status:      strategy.StatusOpen,
-					Side:        order.Side,
-					EntryPrice:  order.Price,
-					Size:        order.FilledSize,
-					OpenOrderID: order.ID,
-					OrderState:  strategy.OrderFilled,
-				})
+				if order.IsClose {
+					pos := e.ledger.GetPosition(order.StrategyID, order.MarketID)
+					e.ledger.ClosePosition(order.StrategyID, order.MarketID)
+					if pos != nil {
+						e.risk.RecordClose(order.StrategyID, order.MarketID, pos.Size, proceeds.Sub(pos.EntryPrice.Mul(pos.Size)))
+					}
+					e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+						StrategyID:  order.StrategyID,
+						MarketID:    order.MarketID,
+						Status:      strategy.StatusClosed,
+						Side:        order.Side,
+						OpenOrderID: order.ID,
+						OrderState:  strategy.OrderFilled,
+					})
+				} else {
+					e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+						StrategyID:  order.StrategyID,
+						MarketID:    order.MarketID,
+						Status:      strategy.StatusOpen,
+						Side:        order.Side,
+						EntryPrice:  order.Price,
+						Size:        order.FilledSize,
+						OpenOrderID: order.ID,
+						OrderState:  strategy.OrderFilled,
+					})
+				}
 				return
 			}
 			if state == OrderCancelled {
 				e.log.Info().Str("order_id", order.ID).Msg("order cancelled")
-				e.ledger.ClosePosition(order.StrategyID, order.MarketID)
-				e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
-					StrategyID:  order.StrategyID,
-					MarketID:    order.MarketID,
-					Status:      strategy.StatusClosed,
-					Side:        order.Side,
-					OpenOrderID: order.ID,
-					OrderState:  strategy.OrderCancelled,
-				})
+				if order.IsClose {
+					// Close order cancelled — position is still live.
+					e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+						StrategyID:  order.StrategyID,
+						MarketID:    order.MarketID,
+						Status:      strategy.StatusOpen,
+						OpenOrderID: order.ID,
+						OrderState:  strategy.OrderCancelled,
+					})
+				} else {
+					e.ledger.ClosePosition(order.StrategyID, order.MarketID)
+					e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+						StrategyID:  order.StrategyID,
+						MarketID:    order.MarketID,
+						Status:      strategy.StatusClosed,
+						Side:        order.Side,
+						OpenOrderID: order.ID,
+						OrderState:  strategy.OrderCancelled,
+					})
+				}
 				return
 			}
-			if state == OrderPartialFill {
+			if state == OrderPartialFill && !order.IsClose {
 				switch e.cfg.PartialFillAction {
 				case "cancel":
 					if err := e.cancelOrder(ctx, order.ID); err != nil {
