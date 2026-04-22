@@ -471,6 +471,17 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 	// Selling: offer slightly below mid to increase fill probability.
 	offsetBPS := decimal.NewFromFloat(float64(e.cfg.DefaultLimitOffsetBPS) / 10000.0)
 	closePrice := midPrice.Sub(midPrice.Mul(offsetBPS))
+
+	e.log.Debug().
+		Str("market_id", sig.MarketID).
+		Str("strategy_id", sig.StrategyID).
+		Str("side", string(closeDir)).
+		Str("size", pos.Size.String()).
+		Str("entry_price", pos.EntryPrice.String()).
+		Str("close_price", closePrice.String()).
+		Str("mid", midPrice.String()).
+		Msg("placing close order")
+
 	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, pos.Size)
 	if err != nil {
 		// "orderbook does not exist" means the market has already resolved.
@@ -544,6 +555,7 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 				e.log.Error().Err(err).Str("order_id", order.ID).Msg("failed to cancel order")
 			}
 			if order.IsClose {
+				e.log.Warn().Str("order_id", order.ID).Str("market_id", order.MarketID).Msg("close order timed out; will retry on next crossover")
 				// Close order timed out without filling — position is still open.
 				e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
 					StrategyID:  order.StrategyID,
@@ -575,22 +587,34 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 			e.ledger.UpdateOrder(order)
 
 			if state == OrderFilled {
-				e.log.Info().Str("order_id", order.ID).Msg("order filled")
 				proceeds := order.Price.Mul(order.FilledSize)
+				var pos *Position
+				pnl := decimal.Zero
+				if order.IsClose {
+					pos = e.ledger.GetPosition(order.StrategyID, order.MarketID)
+					if pos != nil {
+						pnl = proceeds.Sub(pos.EntryPrice.Mul(pos.Size))
+					}
+					e.log.Info().
+						Str("order_id", order.ID).
+						Str("market_id", order.MarketID).
+						Str("proceeds_usdc", proceeds.String()).
+						Str("pnl_usdc", pnl.String()).
+						Msg("close order filled")
+				} else {
+					e.log.Info().Str("order_id", order.ID).Msg("order filled")
+				}
 				e.mu.Lock()
 				if order.IsClose {
-					// Selling tokens: receive USDC back.
 					e.balance = e.balance.Add(proceeds)
 				} else {
-					// Buying tokens: spend USDC.
 					e.balance = e.balance.Sub(proceeds)
 				}
 				e.mu.Unlock()
 				if order.IsClose {
-					pos := e.ledger.GetPosition(order.StrategyID, order.MarketID)
 					e.ledger.ClosePosition(order.StrategyID, order.MarketID)
 					if pos != nil {
-						e.risk.RecordClose(order.StrategyID, order.MarketID, pos.Size, proceeds.Sub(pos.EntryPrice.Mul(pos.Size)))
+						e.risk.RecordClose(order.StrategyID, order.MarketID, pos.Size, pnl)
 					}
 					e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
 						StrategyID:  order.StrategyID,
