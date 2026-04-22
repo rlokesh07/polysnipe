@@ -525,6 +525,17 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 	for {
 		select {
 		case <-ctx.Done():
+			if order.IsClose {
+				// Market torn down while close order was pending.
+				// Polymarket settles on-chain; close the ledger so it doesn't linger.
+				e.ledger.ClosePosition(order.StrategyID, order.MarketID)
+				e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
+					StrategyID:  order.StrategyID,
+					MarketID:    order.MarketID,
+					Status:      strategy.StatusClosed,
+					OpenOrderID: order.ID,
+				})
+			}
 			return
 		case <-deadline.C:
 			// Timeout — cancel the order.

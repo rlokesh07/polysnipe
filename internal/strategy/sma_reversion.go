@@ -202,6 +202,11 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 				continue
 			}
 
+			// Track which side of the SMA price is on this tick (needed for both exit and entry).
+			currentlyAbove := mid.GreaterThan(sma)
+			prevAbove := ms.aboveSMA
+			ms.aboveSMA = &currentlyAbove
+
 			// Exit logic.
 			if ms.hasPos {
 				// Stop-loss: close if YES mid moves more than stopLoss against the position.
@@ -212,9 +217,11 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 					hitStop = true
 				}
 
-				// SMA cross-back: trend reversed through the mean — exit.
-				crossedSMA := (ms.posDir == BuyYes && mid.LessThanOrEqual(sma)) ||
-					(ms.posDir == BuyNo && mid.GreaterThanOrEqual(sma))
+				// SMA cross-back: price crossed back through the mean — exit.
+				// Requires a direction change (same as entry detection) so we don't
+				// exit on the very next tick just because mid dipped to SMA level.
+				crossedSMA := (ms.posDir == BuyYes && !currentlyAbove) ||
+					(ms.posDir == BuyNo && currentlyAbove)
 
 				if hitStop || crossedSMA {
 					reason := "sma_crossback"
@@ -244,11 +251,6 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 				}
 				continue
 			}
-
-			// Track which side of the SMA price is on this tick.
-			currentlyAbove := mid.GreaterThan(sma)
-			prevAbove := ms.aboveSMA
-			ms.aboveSMA = &currentlyAbove
 
 			// Only enter on a fresh crossover — the tick price moves from one side to the other.
 			// If prevAbove is nil the window just warmed up; skip until we see an actual cross.
