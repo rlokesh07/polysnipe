@@ -63,7 +63,7 @@ execution:
   retry_backoff_ms: 200
   cooldown_between_orders_ms: 100
   max_order_spread_cents: 5.0            # skip order if real-time spread > this (0 = disabled)
-  fee_rate_bps: 0                        # max fee rate accepted in orders (0 = protocol default)
+  fee_rate_bps: 200                      # max fee rate bps signed into orders; overrides /fee-rate API when non-zero
 
 # --- Sizing (Kelly Criterion) ---
 sizing:

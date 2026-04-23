@@ -24,6 +24,7 @@ type Manager struct {
 	dailyTrades     int
 	lastTradeDate   time.Time
 	halted          bool
+	onHalt          func() // called once when trading is halted
 
 	// per-market exposure and active strategy counts
 	marketExposure  map[string]decimal.Decimal
@@ -137,8 +138,8 @@ func (m *Manager) RecordClose(strategyID, marketID string, size, pnl decimal.Dec
 	// Check session loss limit.
 	lossLimit := decimal.NewFromFloat(m.cfg.Global.SessionLossLimit)
 	if m.sessionPnL.LessThan(lossLimit) {
-		m.halted = true
 		m.log.Error().Str("session_pnl", m.sessionPnL.String()).Msg("session loss limit exceeded; trading halted")
+		m.triggerHalt()
 	}
 
 	// Check max drawdown.
@@ -149,10 +150,29 @@ func (m *Manager) RecordClose(strategyID, marketID string, size, pnl decimal.Dec
 	if m.cfg.Global.MaxDrawdownPct > 0 && m.peakBalance.IsPositive() {
 		drawdown := m.peakBalance.Sub(currentBalance).Div(m.peakBalance).Mul(decimal.NewFromInt(100))
 		if drawdown.InexactFloat64() >= m.cfg.Global.MaxDrawdownPct {
-			m.halted = true
 			m.log.Error().Str("drawdown_pct", drawdown.String()).Msg("max drawdown exceeded; trading halted")
+			m.triggerHalt()
 		}
 	}
+}
+
+// triggerHalt sets halted and fires the callback. Must be called with m.mu held.
+func (m *Manager) triggerHalt() {
+	if m.halted {
+		return // already halted — don't fire callback twice
+	}
+	m.halted = true
+	if m.onHalt != nil {
+		go m.onHalt()
+	}
+}
+
+// SetHaltCallback registers a function to call when trading is halted.
+// Called in a new goroutine so it does not block the risk manager lock.
+func (m *Manager) SetHaltCallback(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onHalt = fn
 }
 
 // IsHalted returns true if trading is halted.

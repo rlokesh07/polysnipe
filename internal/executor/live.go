@@ -207,12 +207,14 @@ func (e *LiveExecutor) resolveFeeRate(ctx context.Context, tokenID string) int {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	e.log.Debug().Str("token_id", tokenID).Str("raw", string(body)).Msg("fee-rate raw response")
 	var result struct {
 		BaseFee int `json:"base_fee"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return 0
 	}
+	e.log.Debug().Str("token_id", tokenID).Int("parsed_bps", result.BaseFee).Msg("fee-rate parsed")
 	e.feeRateCache.Store(tokenID, result.BaseFee)
 	return result.BaseFee
 }
@@ -300,6 +302,16 @@ func (e *LiveExecutor) Run(ctx context.Context, signalCh <-chan strategy.Signal,
 			}
 		}
 	}()
+
+	// Close all positions when a risk limit is breached.
+	e.risk.SetHaltCallback(func() {
+		e.log.Warn().Msg("risk limit hit; closing all open positions")
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := e.CloseAll(closeCtx); err != nil {
+			e.log.Error().Err(err).Msg("CloseAll after halt failed")
+		}
+	})
 
 	e.log.Info().Msg("live executor started")
 	cooldown := time.Duration(e.cfg.CooldownBetweenOrdersMS) * time.Millisecond
@@ -978,7 +990,10 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	salt := new(big.Int).SetInt64(saltInt64 % (1 << 53))
 
 	negRisk := e.resolveNegRisk(ctx, tokenID.String())
-	feeRateBPS := e.resolveFeeRate(ctx, tokenID.String())
+	feeRateBPS := e.cfg.FeeRateBPS
+	if feeRateBPS == 0 {
+		feeRateBPS = e.resolveFeeRate(ctx, tokenID.String())
+	}
 	e.log.Debug().Str("token_id", tokenID.String()).Bool("neg_risk", negRisk).Int("fee_rate_bps", feeRateBPS).Msg("market params resolved")
 
 	// EIP-712 sign the order.
