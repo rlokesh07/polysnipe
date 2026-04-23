@@ -153,14 +153,13 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 
 			ms := s.getState(snap.MarketID)
 
-			// Detect market resolution: close any position when price approaches a terminal value.
-			// mid ≤ 0.03 → resolving NO  (bad for BuyYes, good for BuyNo but trade is done)
-			// mid ≥ 0.97 → resolving YES (good for BuyYes, bad for BuyNo)
+			// Exit any open position when market is within 3 minutes of close or approaching resolution.
 			if ms.hasPos {
+				nearClose := snap.TimeRemaining > 0 && snap.TimeRemaining < 3*time.Minute
 				nearZero := decimal.NewFromFloat(0.03)
 				nearOne := decimal.NewFromFloat(0.97)
 				resolving := mid.LessThanOrEqual(nearZero) || mid.GreaterThanOrEqual(nearOne)
-				if resolving {
+				if nearClose || resolving {
 					sig := Signal{
 						StrategyID: s.id,
 						MarketID:   snap.MarketID,
@@ -168,13 +167,19 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 						Price:      mid,
 						Timestamp:  time.Now(),
 					}
+					reason := "market_resolving"
+					if nearClose {
+						reason = "near_close"
+					}
 					select {
 					case signalCh <- sig:
 						logger.Warn().
 							Str("market_id", snap.MarketID).
+							Str("reason", reason).
 							Str("mid", mid.String()).
 							Str("side", ms.posDir.String()).
-							Msg("market resolving; closing position")
+							Dur("time_remaining", snap.TimeRemaining).
+							Msg("closing position early")
 						ms.pendingClose = true
 					case <-ctx.Done():
 						return
@@ -255,6 +260,11 @@ func (s *SMAReversion) Run(ctx context.Context, snapshotCh <-chan state.MarketSn
 			// Only enter on a fresh crossover — the tick price moves from one side to the other.
 			// If prevAbove is nil the window just warmed up; skip until we see an actual cross.
 			if prevAbove == nil || *prevAbove == currentlyAbove {
+				continue
+			}
+
+			// Block new entries within 3 minutes of market close.
+			if snap.TimeRemaining > 0 && snap.TimeRemaining < 3*time.Minute {
 				continue
 			}
 

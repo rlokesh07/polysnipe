@@ -393,12 +393,16 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 	if err != nil {
 		return err
 	}
+	one := decimal.NewFromFloat(1.0)
 	offsetBPS := decimal.NewFromFloat(float64(e.cfg.DefaultLimitOffsetBPS) / 10000.0)
 	var limitPrice decimal.Decimal
 	if sig.Direction == strategy.BuyYes {
+		// Buying YES token: price is YES mid, nudge up to improve fill probability.
 		limitPrice = midPrice.Add(midPrice.Mul(offsetBPS))
 	} else {
-		limitPrice = midPrice.Sub(midPrice.Mul(offsetBPS))
+		// Buying NO token: its price = 1 - YES_mid. Nudge down (lower = better fill for buyer).
+		noMid := one.Sub(midPrice)
+		limitPrice = noMid.Sub(noMid.Mul(offsetBPS))
 	}
 
 	// size from sizer is USDC to spend; convert to contracts for the CLOB.
@@ -492,13 +496,22 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		closeDir = strategy.SellNo
 	}
 
-	midPrice, err := e.resolveOrderPrice(sig.MarketID, sig.Price, false)
+	yesMid, err := e.resolveOrderPrice(sig.MarketID, sig.Price, false)
 	if err != nil {
 		return err
 	}
 	// Selling: offer slightly below mid to increase fill probability.
+	// For SellNo we sell NO tokens whose price = 1 - YES_mid, not YES_mid.
+	one := decimal.NewFromFloat(1.0)
 	offsetBPS := decimal.NewFromFloat(float64(e.cfg.DefaultLimitOffsetBPS) / 10000.0)
-	closePrice := midPrice.Sub(midPrice.Mul(offsetBPS))
+	var closePrice decimal.Decimal
+	if pos.Side == strategy.BuyYes {
+		closePrice = yesMid.Sub(yesMid.Mul(offsetBPS))
+	} else {
+		noMid := one.Sub(yesMid)
+		closePrice = noMid.Sub(noMid.Mul(offsetBPS))
+	}
+	midPrice := yesMid // keep for debug log
 
 	e.log.Debug().
 		Str("market_id", sig.MarketID).
@@ -510,11 +523,10 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		Str("mid", midPrice.String()).
 		Msg("placing close order")
 
+	const minOrderContracts = 5.0
 	sellSize := pos.Size
 	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, sellSize)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "not enough balance") {
-		// Polymarket deducted fees from received tokens at entry, so our actual token
-		// balance is less than pos.Size. Parse the real balance and retry once.
 		if actual, parseErr := parseTokenBalance(err.Error()); parseErr == nil && actual.IsPositive() {
 			e.log.Warn().
 				Str("market_id", sig.MarketID).
@@ -523,6 +535,26 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 				Msg("close order: token balance mismatch; retrying with actual balance")
 			e.ledger.UpdatePositionSize(sig.StrategyID, sig.MarketID, actual)
 			sellSize = actual
+			if actual.LessThan(decimal.NewFromFloat(minOrderContracts)) {
+				// Can't close — tokens below Polymarket's 5-contract minimum.
+				// Accept the loss now rather than looping forever.
+				e.ledger.ClosePosition(sig.StrategyID, sig.MarketID)
+				e.risk.RecordClose(sig.StrategyID, sig.MarketID, pos.Size, pos.Size.Neg())
+				e.sizer.RecordTrade(sig.StrategyID, false, pos.Size.Neg())
+				e.sendFeedback(sig.StrategyID, strategy.PositionUpdate{
+					StrategyID: sig.StrategyID,
+					MarketID:   sig.MarketID,
+					Status:     strategy.StatusClosed,
+					Side:       pos.Side,
+					EntryPrice: pos.EntryPrice,
+					Size:       pos.Size,
+				})
+				e.log.Warn().
+					Str("market_id", sig.MarketID).
+					Str("actual_tokens", actual.String()).
+					Msg("token balance below minimum; force-closing position at total loss")
+				return nil
+			}
 			orderID, err = e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, sellSize)
 		}
 	}
