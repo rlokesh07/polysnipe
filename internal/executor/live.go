@@ -408,12 +408,15 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 		contracts = minContracts
 	}
 
+	// Actual USDC cost is contracts × limitPrice (may exceed sizer's size when
+	// clamped to the 5-contract minimum).
+	cost := contracts.Mul(limitPrice)
 	e.mu.Lock()
 	balance := e.balance
 	e.mu.Unlock()
-	if size.GreaterThan(balance) {
-		return fmt.Errorf("insufficient balance %.4f USDC (order costs %.4f); skipping",
-			balance.InexactFloat64(), size.InexactFloat64())
+	if cost.GreaterThan(balance) {
+		return fmt.Errorf("insufficient balance %.4f USDC (order costs %.4f for %s contracts); skipping",
+			balance.InexactFloat64(), cost.InexactFloat64(), contracts.String())
 	}
 
 	orderID, err := e.submitOrder(ctx, sig.MarketID, sig.Direction, limitPrice, contracts)
@@ -883,7 +886,14 @@ func (e *LiveExecutor) submitOrder(ctx context.Context, marketID string, dir str
 	if priceCents.IsZero() {
 		priceCents = decimal.NewFromInt(1)
 	}
-	q := size.Mul(hundred).Round(0) // number of 0.01-token units
+	// SELL: floor so we never claim more tokens than we actually hold.
+	// BUY:  round normally — USDC is fungible and we control how much we spend.
+	var q decimal.Decimal
+	if isSell {
+		q = size.Mul(hundred).Floor()
+	} else {
+		q = size.Mul(hundred).Round(0)
+	}
 	if q.IsZero() {
 		q = decimal.NewFromInt(1)
 	}
