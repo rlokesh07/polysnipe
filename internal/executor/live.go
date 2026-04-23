@@ -401,17 +401,22 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 		limitPrice = midPrice.Sub(midPrice.Mul(offsetBPS))
 	}
 
-	// Cost in USDC = price_per_contract × contracts.
-	cost := limitPrice.Mul(size)
+	// size from sizer is USDC to spend; convert to contracts for the CLOB.
+	contracts := size.Div(limitPrice).Round(2)
+	minContracts := decimal.NewFromFloat(5.0)
+	if contracts.LessThan(minContracts) {
+		contracts = minContracts
+	}
+
 	e.mu.Lock()
 	balance := e.balance
 	e.mu.Unlock()
-	if cost.GreaterThan(balance) {
+	if size.GreaterThan(balance) {
 		return fmt.Errorf("insufficient balance %.4f USDC (order costs %.4f); skipping",
-			balance.InexactFloat64(), cost.InexactFloat64())
+			balance.InexactFloat64(), size.InexactFloat64())
 	}
 
-	orderID, err := e.submitOrder(ctx, sig.MarketID, sig.Direction, limitPrice, size)
+	orderID, err := e.submitOrder(ctx, sig.MarketID, sig.Direction, limitPrice, contracts)
 	if err != nil {
 		return fmt.Errorf("submit order: %w", err)
 	}
@@ -422,7 +427,7 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 		MarketID:   sig.MarketID,
 		Side:       sig.Direction,
 		Price:      limitPrice,
-		Size:       size,
+		Size:       contracts,
 		State:      OrderPending,
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
@@ -434,7 +439,7 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 		MarketID:    sig.MarketID,
 		Side:        sig.Direction,
 		EntryPrice:  limitPrice,
-		Size:        size,
+		Size:        contracts,
 		OpenOrderID: orderID,
 		Status:      strategy.StatusOpen,
 	}
@@ -442,7 +447,7 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 		return err
 	}
 
-	e.risk.RecordOpen(sig.StrategyID, sig.MarketID, size)
+	e.risk.RecordOpen(sig.StrategyID, sig.MarketID, size) // size = USDC for risk limits
 
 	// Do NOT send StatusOpen feedback here — the order is merely pending on the CLOB,
 	// not filled. monitorOrder will send StatusOpen once the order actually fills,
@@ -450,6 +455,26 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 	// on submit was the root cause of 500+ phantom-position errors.
 	go e.monitorOrder(ctx, order)
 	return nil
+}
+
+// parseTokenBalance extracts the token balance from a Polymarket "not enough balance" error.
+// Error format: "... balance: 4816400, order amount: 5000000 ..."
+func parseTokenBalance(errMsg string) (decimal.Decimal, error) {
+	const prefix = "balance: "
+	i := strings.Index(errMsg, prefix)
+	if i < 0 {
+		return decimal.Zero, fmt.Errorf("balance not found in error")
+	}
+	rest := errMsg[i+len(prefix):]
+	end := strings.IndexAny(rest, ", \n")
+	if end < 0 {
+		end = len(rest)
+	}
+	raw, err := decimal.NewFromString(rest[:end])
+	if err != nil {
+		return decimal.Zero, err
+	}
+	return raw.Div(decimal.NewFromInt(1_000_000)), nil
 }
 
 func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal) error {
@@ -475,14 +500,29 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 	e.log.Debug().
 		Str("market_id", sig.MarketID).
 		Str("strategy_id", sig.StrategyID).
-		Str("side", string(closeDir)).
+		Str("side", closeDir.String()).
 		Str("size", pos.Size.String()).
 		Str("entry_price", pos.EntryPrice.String()).
 		Str("close_price", closePrice.String()).
 		Str("mid", midPrice.String()).
 		Msg("placing close order")
 
-	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, pos.Size)
+	sellSize := pos.Size
+	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, sellSize)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "not enough balance") {
+		// Polymarket deducted fees from received tokens at entry, so our actual token
+		// balance is less than pos.Size. Parse the real balance and retry once.
+		if actual, parseErr := parseTokenBalance(err.Error()); parseErr == nil && actual.IsPositive() {
+			e.log.Warn().
+				Str("market_id", sig.MarketID).
+				Str("recorded_size", sellSize.String()).
+				Str("actual_tokens", actual.String()).
+				Msg("close order: token balance mismatch; retrying with actual balance")
+			e.ledger.UpdatePositionSize(sig.StrategyID, sig.MarketID, actual)
+			sellSize = actual
+			orderID, err = e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, sellSize)
+		}
+	}
 	if err != nil {
 		// "orderbook does not exist" means the market has already resolved.
 		// Force-close the position so the strategy stops retrying.
@@ -515,7 +555,7 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		Side:       closeDir,
 		IsClose:    true,
 		Price:      closePrice,
-		Size:       pos.Size,
+		Size:       sellSize,
 		State:      OrderPending,
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
@@ -602,7 +642,15 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 						Str("pnl_usdc", pnl.String()).
 						Msg("close order filled")
 				} else {
-					e.log.Info().Str("order_id", order.ID).Msg("order filled")
+					e.log.Info().
+						Str("order_id", order.ID).
+						Str("ordered_size", order.Size.String()).
+						Str("filled_size", order.FilledSize.String()).
+						Str("size_delta", order.Size.Sub(order.FilledSize).String()).
+						Msg("entry order filled")
+					// Sync ledger to actual filled size — CLOB may report fewer tokens than
+					// ordered if fees were deducted from the takerAmount at fill time.
+					e.ledger.UpdatePositionSize(order.StrategyID, order.MarketID, order.FilledSize)
 				}
 				e.mu.Lock()
 				if order.IsClose {
@@ -615,6 +663,7 @@ func (e *LiveExecutor) monitorOrder(ctx context.Context, order Order) {
 					e.ledger.ClosePosition(order.StrategyID, order.MarketID)
 					if pos != nil {
 						e.risk.RecordClose(order.StrategyID, order.MarketID, pos.Size, pnl)
+						e.sizer.RecordTrade(order.StrategyID, pnl.IsPositive(), pnl)
 					}
 					e.sendFeedback(order.StrategyID, strategy.PositionUpdate{
 						StrategyID:  order.StrategyID,

@@ -71,7 +71,7 @@ sizing:
   kelly_fraction: 0.25                     # quarter-Kelly
   kelly_min_sample_size: 20                # trades needed before Kelly kicks in
   fixed_fraction_fallback: 0.02            # 2% of balance when insufficient data
-  min_order_size: 5.0                      # minimum order size in contracts (Polymarket enforces min 5)
+  min_order_size: 1.0                      # minimum order size in contracts (Polymarket enforces min 5)
   max_order_size: 500.0                    # maximum dollar order regardless of Kelly
 
 # --- Risk Management ---
