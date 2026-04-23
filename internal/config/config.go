@@ -84,6 +84,7 @@ type ExecutionConfig struct {
 	CooldownBetweenOrdersMS int     `yaml:"cooldown_between_orders_ms"`
 	MaxOrderSpreadCents     float64 `yaml:"max_order_spread_cents"`
 	FeeRateBPS              int     `yaml:"fee_rate_bps"`
+	MinContractSize         float64 `yaml:"min_contract_size"`
 }
 
 type SizingConfig struct {

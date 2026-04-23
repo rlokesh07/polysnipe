@@ -419,7 +419,7 @@ func (e *LiveExecutor) placeEntryOrder(ctx context.Context, sig strategy.Signal,
 
 	// size from sizer is USDC to spend; convert to contracts for the CLOB.
 	contracts := size.Div(limitPrice).Round(2)
-	minContracts := decimal.NewFromFloat(5.0)
+	minContracts := decimal.NewFromFloat(e.cfg.MinContractSize)
 	if contracts.LessThan(minContracts) {
 		contracts = minContracts
 	}
@@ -535,7 +535,7 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 		Str("mid", midPrice.String()).
 		Msg("placing close order")
 
-	const minOrderContracts = 5.0
+	minOrderContracts := decimal.NewFromFloat(e.cfg.MinContractSize)
 	sellSize := pos.Size
 	orderID, err := e.submitOrder(ctx, sig.MarketID, closeDir, closePrice, sellSize)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "not enough balance") {
@@ -547,7 +547,7 @@ func (e *LiveExecutor) placeCloseOrder(ctx context.Context, sig strategy.Signal)
 				Msg("close order: token balance mismatch; retrying with actual balance")
 			e.ledger.UpdatePositionSize(sig.StrategyID, sig.MarketID, actual)
 			sellSize = actual
-			if actual.LessThan(decimal.NewFromFloat(minOrderContracts)) {
+			if actual.LessThan(minOrderContracts) {
 				// Can't close — tokens below Polymarket's 5-contract minimum.
 				// Accept the loss now rather than looping forever.
 				e.ledger.ClosePosition(sig.StrategyID, sig.MarketID)
